@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>长截图预览 · LongShot</title>
+  <link rel="stylesheet" href="viewer.css" />
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <div class="mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/>
+          <path d="M12 8v8M9 13l3 3 3-3"/>
+        </svg>
+      </div>
+      <div class="titles">
+        <div class="name" id="title">长截图</div>
+        <div class="sub" id="sub">—</div>
+      </div>
+    </div>
+
+    <div class="chips" id="stats"></div>
+    <div class="spacer"></div>
+
+    <div class="tools">
+      <button class="tool" id="btnCrop" title="拖拽框选要保留的部分">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 3v13a1 1 0 0 0 1 1h13" /><path d="M3 6h13a1 1 0 0 1 1 1v13" />
+        </svg>
+        <span>裁剪</span>
+      </button>
+      <button class="tool" id="btnReset" title="恢复为完整画面">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 10a8 8 0 1 1 2.3 6.3" /><path d="M4 5v5h5" />
+        </svg>
+        <span>重置</span>
+      </button>
+      <button class="tool" id="btnZoom" title="在「适应宽度」与「原始大小」之间切换">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="6.4" /><path d="M20 20l-4.2-4.2" />
+        </svg>
+        <span id="zoomLabel">适应宽度</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="stage" id="stage">
+    <div class="paper" id="paper">
+      <canvas id="view"></canvas>
+      <div class="cropLayer" id="cropLayer" hidden><div class="cropBox" id="cropBox"></div></div>
+    </div>
+  </main>
+
+  <div class="loading" id="loading">
+    <div class="lcard">
+      <div class="spin"></div>
+      <div class="lt" id="loadingText">正在合成截图…</div>
+      <div class="lbar"><i id="loadingBar"></i></div>
+    </div>
+  </div>
+
+  <div class="dock">
+    <div class="dockCard">
+      <div class="seg" id="fmtSeg">
+        <button data-fmt="png" class="on">PNG</button>
+        <button data-fmt="jpg">JPG</button>
+      </div>
+      <div class="q" id="qWrap" hidden>
+        <input type="range" id="quality" min="0.5" max="1" step="0.02" value="0.92" />
+        <output id="qVal">92%</output>
+      </div>
+
+      <span class="dash"></span>
+
+      <span class="kbdTip"><kbd>Ctrl</kbd><kbd>C</kbd> 复制图片</span>
+
+      <button class="ghost" id="btnCopy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="9" width="11" height="11" rx="2" /><path d="M7 15H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v2" />
+        </svg>
+        <span>复制</span>
+      </button>
+      <button class="ghost" id="btnPrint" title="打印或另存为 PDF">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M7 9V4h10v5" /><rect x="4" y="9" width="16" height="7" rx="2" /><path d="M7 14h10v6H7z" />
+        </svg>
+        <span>PDF</span>
+      </button>
+      <button class="primary" id="btnDownload" title="保存到下载目录（Ctrl+S）">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 4v10" /><path d="M8.5 11.2 12 14.7l3.5-3.5" /><path d="M4.5 18.5h15" />
+        </svg>
+        <span>下载图片</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="viewer.js"></script>
+</body>
+</html>

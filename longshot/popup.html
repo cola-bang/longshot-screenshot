@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>长截图 LongShot</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="head">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/>
+        <path d="M12 8v8M9 13l3 3 3-3"/>
+      </svg>
+    </div>
+    <div class="brand">
+      <div class="name">长截图 <span>LongShot</span></div>
+      <div class="page" id="pageTitle">本地处理 · 不上传</div>
+    </div>
+    <span class="ver">v1.0</span>
+  </header>
+
+  <div class="alert" id="alert" hidden></div>
+
+  <main class="body">
+    <button class="primary" id="btnFull" data-mode="full">
+      <span class="ico">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="6" y="3" width="12" height="18" rx="2.4" />
+          <path d="M9.5 7.5h5M9.5 11h5M9.5 14.5h3.2" />
+        </svg>
+      </span>
+      <span class="txt">
+        <strong>整页长截图</strong>
+        <em>滚动拼接整页，去掉重复吸顶栏</em>
+      </span>
+      <kbd>Alt ⇧ S</kbd>
+    </button>
+
+    <div class="grid">
+      <button class="tile" data-mode="visible">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.5" y="5" width="17" height="14" rx="2.2" /><path d="M8 12h8" />
+        </svg>
+        <span>可视区域</span>
+      </button>
+      <button class="tile" data-mode="region">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 8V5.6A1.6 1.6 0 0 1 5.6 4H8M16 4h2.4A1.6 1.6 0 0 1 20 5.6V8M20 16v2.4a1.6 1.6 0 0 1-1.6 1.6H16M8 20H5.6A1.6 1.6 0 0 1 4 18.4V16" />
+          <rect x="9" y="9" width="6" height="6" rx="1" stroke-dasharray="2 2" />
+        </svg>
+        <span>框选长图</span>
+      </button>
+      <button class="tile" data-mode="element">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.5" y="4" width="17" height="16" rx="2.2" />
+          <path d="M3.5 9h17" /><path d="M12 12.5v4M9.8 14.4 12 16.6l2.2-2.2" />
+        </svg>
+        <span>元素长图</span>
+      </button>
+    </div>
+
+    <section class="opts">
+      <div class="row">
+        <label class="lab">图片格式</label>
+        <div class="seg" id="fmtSeg">
+          <button data-fmt="png" class="on">PNG</button>
+          <button data-fmt="jpg">JPG</button>
+        </div>
+      </div>
+      <div class="row" id="qualityRow" hidden>
+        <label class="lab">JPG 质量</label>
+        <input type="range" id="quality" min="0.5" max="1" step="0.02" />
+        <output id="qVal">92%</output>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="hideSticky" checked />
+        <i></i>
+        <span>隐藏吸顶 / 悬浮元素<em>避免导航栏在长图中重复出现</em></span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="preload" checked />
+        <i></i>
+        <span>预加载图片<em>先扫一遍页面，让懒加载图片显示出来</em></span>
+      </label>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Alt+Shift+S 整页 · Alt+Shift+X 框选</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

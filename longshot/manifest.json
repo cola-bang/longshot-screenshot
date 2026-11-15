@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "长截图 LongShot",
+  "version": "1.2.0",
+  "description": "整页长截图 / 区域截图 / 元素长截图。自动隐藏吸顶浮层、无缝拼接，支持 PNG、JPG、复制到剪贴板与打印成 PDF。",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "storage",
+    "unlimitedStorage",
+    "clipboardWrite"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "长截图 LongShot",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "capture-full": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "整页长截图"
+    },
+    "capture-region": {
+      "suggested_key": {
+        "default": "Alt+Shift+X"
+      },
+      "description": "区域截图"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "longshot-e2e",
+  "version": "1.0.0",
+  "description": "LongShot 扩展的端到端测试（Playwright）",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright-core": "^1.65.1"
+  }
+}
