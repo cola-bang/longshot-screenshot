@@ -106,12 +106,26 @@ button.on { background: linear-gradient(135deg, rgba(59, 130, 246, .34), rgba(34
     radial-gradient(70% 42% at 50% 0%, rgba(59, 130, 246, .09), transparent 68%),
     var(--bg);
 }
-.stage::-webkit-scrollbar { width: 10px; height: 10px; }
+.stage { cursor: grab; }
+.stage.grabbing { cursor: grabbing; user-select: none; }
+.stage::-webkit-scrollbar { width: 12px; height: 12px; }
+.stage::-webkit-scrollbar-track { background: rgba(255, 255, 255, .03); }
 .stage::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, .12); border-radius: 8px;
+  background: rgba(255, 255, 255, .30); border-radius: 8px;
   border: 3px solid transparent; background-clip: padding-box;
 }
-.stage::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .2); background-clip: padding-box; }
+.stage::-webkit-scrollbar-thumb:hover { background: rgba(150, 190, 255, .55); background-clip: padding-box; }
+
+.toTop {
+  position: fixed; right: 20px; bottom: 96px; z-index: 35;
+  width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center; padding: 0;
+  background: rgba(20, 25, 34, .92); border: 1px solid var(--line-strong);
+  color: #c8d3e4; box-shadow: 0 10px 26px rgba(0, 0, 0, .45);
+  backdrop-filter: blur(10px);
+}
+.toTop svg { width: 17px; height: 17px; }
+.toTop:hover { color: #fff; border-color: rgba(120, 175, 255, .5); }
 
 .paper {
   position: relative;

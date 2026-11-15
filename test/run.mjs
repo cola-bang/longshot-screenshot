@@ -164,6 +164,62 @@ else log(`高度校验通过 (${r1.baseH} ≈ ${expectH})`);
 await saveBase(v1, 'full.png');
 await v1.screenshot({ path: path.join(OUT, 'viewer.png') });
 
+/* ------------------------- 1.4 预览页滚动 ------------------------- */
+{
+  const pos0 = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  await v1.mouse.move(500, 300);
+  await v1.mouse.wheel(0, 900);
+  await v1.waitForTimeout(400);
+  const pos1 = await v1.evaluate(() => ({
+    top: document.getElementById('stage').scrollTop,
+    h: document.getElementById('stage').clientHeight,
+    sh: document.getElementById('stage').scrollHeight
+  }));
+  log(`预览页滚动：scrollTop ${pos0} -> ${pos1.top}（可视高 ${pos1.h}，内容高 ${pos1.sh}）`);
+  if (pos1.top <= pos0) fail('预览页无法滚动（scrollTop 没有变化）');
+
+  // 鼠标停在底部悬浮工具栏上时，滚轮也应该能滚动
+  const dock = await v1.evaluate(() => {
+    const r = document.getElementById('dock').getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  });
+  const base = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  await v1.mouse.move(dock.x, dock.y);
+  await v1.mouse.wheel(0, 600);
+  await v1.waitForTimeout(300);
+  const afterDock = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  log(`悬浮工具栏上的滚轮：${base} -> ${afterDock}`);
+  if (afterDock <= base) fail('鼠标停在悬浮工具栏上时无法滚动');
+}
+
+/* ------------------------- 1.4 预览页滚动 ------------------------- */
+{
+  const pos0 = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  await v1.mouse.move(500, 300);
+  await v1.mouse.wheel(0, 900);
+  await v1.waitForTimeout(400);
+  const pos1 = await v1.evaluate(() => ({
+    top: document.getElementById('stage').scrollTop,
+    h: document.getElementById('stage').clientHeight,
+    sh: document.getElementById('stage').scrollHeight
+  }));
+  log(`预览页滚动：scrollTop ${pos0} -> ${pos1.top}（可视高 ${pos1.h}，内容高 ${pos1.sh}）`);
+  if (pos1.top <= pos0) fail('预览页无法滚动（scrollTop 没有变化）');
+
+  // 鼠标停在底部悬浮工具栏上时，滚轮也应该能滚动
+  const dock = await v1.evaluate(() => {
+    const r = document.getElementById('dock').getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  });
+  const base = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  await v1.mouse.move(dock.x, dock.y);
+  await v1.mouse.wheel(0, 600);
+  await v1.waitForTimeout(300);
+  const afterDock = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  log(`悬浮工具栏上的滚轮：${base} -> ${afterDock}`);
+  if (afterDock <= base) fail('鼠标停在悬浮工具栏上时无法滚动');
+}
+
 /* ------------------------- 1.5 预览页 Ctrl+C 复制 ------------------------- */
 log('— 预览页 Ctrl+C 复制 —');
 await v1.bringToFront();

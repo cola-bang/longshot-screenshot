@@ -9,7 +9,7 @@ set "PF=%ProgramFiles%"
 set "PF86=%ProgramFiles(x86)%"
 
 echo ==================================================
-echo    LongShot 长截图  v1.2.0   安装助手
+echo    LongShot 长截图  v1.2.1   安装助手
 echo ==================================================
 echo.
 

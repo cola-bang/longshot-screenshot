@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "长截图 LongShot",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "整页长截图 / 区域截图 / 元素长截图。自动隐藏吸顶浮层、无缝拼接，支持 PNG、JPG、复制到剪贴板与打印成 PDF。",
   "minimum_chrome_version": "102",
   "permissions": [

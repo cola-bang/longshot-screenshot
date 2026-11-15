@@ -380,6 +380,61 @@ async function copyImage() {
   }
 }
 
+/* ------------------------------------------------------------ pan / nav */
+
+function bindPan() {
+  const stage = $('stage');
+  const toTop = $('toTop');
+  let pan = null;
+
+  stage.addEventListener('pointerdown', (e) => {
+    if (cropping || e.button !== 0) return;
+    if (e.target.closest('#cropLayer')) return;
+    pan = { x: e.clientX, y: e.clientY, left: stage.scrollLeft, top: stage.scrollTop };
+    try {
+      stage.setPointerCapture(e.pointerId);
+    } catch (err) {
+      /* ignore */
+    }
+    stage.classList.add('grabbing');
+  });
+
+  stage.addEventListener('pointermove', (e) => {
+    if (!pan) return;
+    stage.scrollLeft = pan.left - (e.clientX - pan.x);
+    stage.scrollTop = pan.top - (e.clientY - pan.y);
+  });
+
+  const endPan = () => {
+    pan = null;
+    stage.classList.remove('grabbing');
+  };
+  stage.addEventListener('pointerup', endPan);
+  stage.addEventListener('pointercancel', endPan);
+
+  // 鼠标停在悬浮工具栏上时，滚轮也应该滚动图片
+  const dock = $('dock');
+  if (dock) {
+    dock.addEventListener(
+      'wheel',
+      (e) => {
+        e.preventDefault();
+        stage.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      },
+      { passive: false }
+    );
+  }
+
+  stage.addEventListener(
+    'scroll',
+    () => {
+      toTop.hidden = stage.scrollTop < 300;
+    },
+    { passive: true }
+  );
+  toTop.addEventListener('click', () => stage.scrollTo({ top: 0, behavior: 'smooth' }));
+}
+
 /* ----------------------------------------------------------------- init */
 
 function bindUI() {
@@ -421,6 +476,30 @@ function bindUI() {
       }
       return;
     }
+    const stage = $('stage');
+    if (!meta) {
+      const page = Math.round(stage.clientHeight * 0.9);
+      if (e.key === 'PageDown') {
+        e.preventDefault();
+        stage.scrollTop += page;
+        return;
+      }
+      if (e.key === 'PageUp') {
+        e.preventDefault();
+        stage.scrollTop -= page;
+        return;
+      }
+      if (e.key === 'Home') {
+        e.preventDefault();
+        stage.scrollTop = 0;
+        return;
+      }
+      if (e.key === 'End') {
+        e.preventDefault();
+        stage.scrollTop = stage.scrollHeight;
+        return;
+      }
+    }
     if (!meta) return;
     const key = (e.key || '').toLowerCase();
     if (key === 'c') {
@@ -444,6 +523,7 @@ function bindUI() {
   });
 
   bindCrop();
+  bindPan();
   updateZoomLabel();
 }
 

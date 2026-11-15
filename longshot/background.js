@@ -76,6 +76,13 @@ async function injectContent(tabId) {
 }
 
 async function startCapture(tabId, mode, settings) {
+  // popup 拿不到 tabId 时（后台刚被唤醒 / 查询超时），自己再取一次当前标签页
+  if (tabId == null) {
+    const tabs = await p(chrome.tabs, 'query', { active: true, lastFocusedWindow: true }).catch(() => []);
+    tabId = tabs && tabs[0] ? tabs[0].id : null;
+  }
+  if (tabId == null) throw new Error('找不到当前标签页，请刷新页面后重试');
+
   const tab = await p(chrome.tabs, 'get', tabId).catch(() => null);
   if (!tab) throw new Error('找不到目标标签页');
   const reason = blockedReason(tab.url);
@@ -91,6 +98,12 @@ async function startCapture(tabId, mode, settings) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const type = msg && msg.type;
   if (!type) return undefined;
+
+  if (type === 'PING') {
+    // popup 打开时先发一次，把 Service Worker 提前唤醒，避免点击后等冷启动
+    sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
+    return undefined;
+  }
 
   if (type === 'CAPTURE_FRAME') {
     const tabId = (sender.tab && sender.tab.id) || msg.tabId;

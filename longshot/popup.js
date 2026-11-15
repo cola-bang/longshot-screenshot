@@ -1,16 +1,37 @@
-/* LongShot · popup */
+/* LongShot · popup
+ * 打开即渲染（同步读 localStorage），不等待后台；点击后用超时保护给出明确反馈。
+ */
 'use strict';
 
-const DEFAULTS = { fmt: 'png', quality: 0.92, hideSticky: true, preload: true };
+const DEFAULTS = { hideSticky: true, preload: true };
+const LS_KEY = 'ls-popup-settings';
+const START_TIMEOUT = 6000;
+
 const $ = (id) => document.getElementById(id);
 
 let currentTab = null;
-let settings = Object.assign({}, DEFAULTS);
+let starting = false;
+
+function loadSettings() {
+  try {
+    return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(LS_KEY) || '{}'));
+  } catch (e) {
+    return Object.assign({}, DEFAULTS);
+  }
+}
+
+function saveSettings(obj) {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(obj));
+  } catch (e) {
+    /* 忽略：隐私模式下可能不可写 */
+  }
+}
 
 function showAlert(text) {
   const el = $('alert');
   el.textContent = text;
-  el.hidden = false;
+  el.hidden = !text;
 }
 
 function setBusy(flag) {
@@ -19,115 +40,123 @@ function setBusy(flag) {
   });
 }
 
-function syncFormatUI() {
-  document.querySelectorAll('#fmtSeg button').forEach((b) => {
-    b.classList.toggle('on', b.dataset.fmt === settings.fmt);
-  });
-  $('qualityRow').hidden = settings.fmt !== 'jpg';
-  $('quality').value = String(settings.quality);
-  $('qVal').textContent = Math.round(settings.quality * 100) + '%';
-}
-
-function readSettings() {
-  return {
-    fmt: settings.fmt,
-    quality: settings.quality,
-    hideSticky: $('hideSticky').checked,
-    preload: $('preload').checked
-  };
-}
-
-async function persist() {
-  settings = Object.assign({}, settings, readSettings());
-  try {
-    await chrome.storage.local.set({ settings });
-  } catch (e) {
-    /* 忽略写入失败 */
-  }
-}
-
-async function start(mode) {
-  if (!currentTab || currentTab.tabId == null) return;
-  setBusy(true);
-  const payload = readSettings();
-  await persist();
-
-  let res = null;
-  try {
-    res = await chrome.runtime.sendMessage({
-      type: 'START_CAPTURE',
-      tabId: currentTab.tabId,
-      mode,
-      settings: payload
+function sendOnce(msg, timeout) {
+  const call = new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(msg, (res) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve(res);
     });
-  } catch (e) {
-    res = { ok: false, error: e.message || '扩展内部错误' };
-  }
+  });
+  if (!timeout) return call;
+  return Promise.race([
+    call,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('后台没有响应，请到扩展管理页点一次「重新加载」')), timeout)
+    )
+  ]);
+}
 
-  if (!res || res.ok === false) {
-    setBusy(false);
-    showAlert((res && res.error) || '启动截图失败，请刷新页面后重试');
-    return;
+// Service Worker 冷启动期间第一条消息可能直接失败（Receiving end does not exist），
+// 这类错误重试即可恢复；超时类错误不重试，避免重复触发截图。
+const RETRYABLE = /Receiving end does not exist|message port closed|Could not establish connection|Extension context invalidated/i;
+
+async function send(msg, timeout, attempts = 3) {
+  let lastErr = null;
+  for (let i = 0; i < (attempts || 1); i += 1) {
+    try {
+      return await sendOnce(msg, timeout);
+    } catch (e) {
+      lastErr = e;
+      if (!RETRYABLE.test(e.message || '')) throw e;
+      await new Promise((r) => setTimeout(r, 120 * (i + 1)));
+    }
   }
-  window.close();
+  throw lastErr;
+}
+
+async function start(mode, btn) {
+  if (starting) return;
+  starting = true;
+
+  const label = btn.querySelector('strong') || btn.querySelector('span');
+  const prevText = label ? label.textContent : '';
+  if (label) label.textContent = '启动中…';
+  btn.classList.add('busy');
+  setBusy(true);
+  showAlert('');
+
+  try {
+    const payload = {
+      hideSticky: $('hideSticky').checked,
+      preload: $('preload').checked
+    };
+    saveSettings(payload);
+
+    const res = await send(
+      { type: 'START_CAPTURE', tabId: currentTab && currentTab.tabId, mode, settings: payload },
+      START_TIMEOUT
+    );
+
+    if (!res || res.ok === false) throw new Error((res && res.error) || '启动失败');
+    window.close();
+  } catch (e) {
+    starting = false;
+    btn.classList.remove('busy');
+    if (label) label.textContent = prevText;
+    setBusy(false);
+    showAlert(e.message || String(e));
+  }
 }
 
 async function init() {
-  const verEl = document.querySelector('.ver');
-  if (verEl) verEl.textContent = 'v' + chrome.runtime.getManifest().version.split('.').slice(0, 2).join('.');
-
-  try {
-    const stored = await chrome.storage.local.get('settings');
-    settings = Object.assign({}, DEFAULTS, stored.settings || {});
-  } catch (e) {
-    /* 用默认值 */
-  }
-  syncFormatUI();
+  const settings = loadSettings();
   $('hideSticky').checked = settings.hideSticky !== false;
   $('preload').checked = settings.preload !== false;
 
-  document.querySelectorAll('#fmtSeg button').forEach((b) => {
-    b.addEventListener('click', () => {
-      settings.fmt = b.dataset.fmt;
-      syncFormatUI();
-      persist();
-    });
-  });
-  $('quality').addEventListener('input', (e) => {
-    settings.quality = Number(e.target.value);
-    $('qVal').textContent = Math.round(settings.quality * 100) + '%';
-  });
-  $('quality').addEventListener('change', persist);
-  $('hideSticky').addEventListener('change', persist);
-  $('preload').addEventListener('change', persist);
+  const verEl = document.querySelector('.ver');
+  if (verEl) {
+    verEl.textContent = 'v' + chrome.runtime.getManifest().version.split('.').slice(0, 2).join('.');
+  }
 
   document.querySelectorAll('[data-mode]').forEach((b) => {
-    b.addEventListener('click', () => start(b.dataset.mode));
+    b.addEventListener('click', () => start(b.dataset.mode, b));
   });
+  $('hideSticky').addEventListener('change', () =>
+    saveSettings({ hideSticky: $('hideSticky').checked, preload: $('preload').checked })
+  );
+  $('preload').addEventListener('change', () =>
+    saveSettings({ hideSticky: $('hideSticky').checked, preload: $('preload').checked })
+  );
+
+  // 提前唤醒 Service Worker，点击时就不用等冷启动
+  try {
+    chrome.runtime.sendMessage({ type: 'PING' }, () => void chrome.runtime.lastError);
+  } catch (e) {
+    /* ignore */
+  }
 
   try {
-    const info = await chrome.runtime.sendMessage({ type: 'GET_ACTIVE_TAB' });
-    if (!info || info.ok === false) {
-      showAlert((info && info.error) || '无法读取当前标签页');
-      setBusy(true);
-      return;
-    }
-    currentTab = info;
-    let host = '';
-    try {
-      host = info.url ? new URL(info.url).hostname.replace(/^www\./, '') : '';
-    } catch (e) {
-      host = '';
-    }
-    $('pageTitle').textContent = host || '本地处理 · 不上传';
-    $('pageTitle').title = info.url || '';
-    if (info.error) {
-      showAlert(info.error);
-      setBusy(true);
+    const info = await send({ type: 'GET_ACTIVE_TAB' }, 4000);
+    if (info && info.ok !== false) {
+      currentTab = info;
+      let host = '';
+      try {
+        host = info.url ? new URL(info.url).hostname.replace(/^www\./, '') : '';
+      } catch (e) {
+        host = '';
+      }
+      $('pageTitle').textContent = host || '本地处理 · 不上传';
+      $('pageTitle').title = info.url || '';
+      if (info.error) {
+        showAlert(info.error);
+      }
+    } else {
+      showAlert('后台尚未就绪，点击模式会自动重试');
     }
   } catch (e) {
-    showAlert('扩展后台尚未就绪，请重新打开面板');
-    setBusy(true);
+    console.warn('[LongShot] popup init failed:', e && e.message);
+    $('pageTitle').textContent = '后台尚未就绪';
   }
 }
 
