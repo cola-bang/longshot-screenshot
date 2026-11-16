@@ -108,7 +108,7 @@ popup ──► background ──► content script（编排）
                      chrome.tabs.captureVisibleTab
                             │
                             ▼
-                  帧数据写入 storage.local
+                  帧二进制写入 IndexedDB（合成后即刻释放）
                             │
                             ▼
                 viewer 页按记录的偏移合成画布

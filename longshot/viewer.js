@@ -1,5 +1,5 @@
 /* LongShot · viewer
- * 从 storage 取出逐帧截图，按记录的偏移合成一张长图，并提供裁剪 / 复制 / 下载 / 打印。
+ * 从 IndexedDB 流式逐帧解码、按偏移合成长图并即刻清理缓存，提供裁剪 / 复制 / 下载 / 打印。
  * 快捷键：Ctrl(⌘)+C 复制图片、Ctrl(⌘)+S 下载、Esc 退出裁剪。
  */
 'use strict';
@@ -7,7 +7,10 @@
 const $ = (id) => document.getElementById(id);
 const sessionId = new URLSearchParams(location.search).get('id');
 
-const MAX_PIXELS = 46e6; // 单张位图上限，超出则等比降采样（避免浏览器 OOM）
+const DB_NAME = 'longshot-db';
+const DB_VERSION = 1;
+const DEV_MEM = Number(navigator.deviceMemory) || 8;
+const MAX_PIXELS = DEV_MEM <= 2 ? 20e6 : DEV_MEM <= 4 ? 30e6 : 46e6; // 按设备内存自适应降采样上限，避免低配机 OOM
 const MAX_DIM = 32000;
 
 const state = {
@@ -19,13 +22,80 @@ const state = {
   fmt: 'png',
   quality: 0.92,
   zoom: 'fit',
-  downscaled: 1
+  downscaled: 1,
+  previewCanvas: null,
+  renderedCropKey: ''
 };
 
 // 便于排查问题：在控制台可查看 window.__longshot
 window.__longshot = state;
 
 let busy = false;
+let cachedExport = null;
+let dbPromise = null;
+
+/* ---------------------------------------------------------- IndexedDB */
+
+function openDb() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('sessions')) {
+        db.createObjectStore('sessions', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('frames')) {
+        db.createObjectStore('frames', { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      dbPromise = null;
+      reject(req.error || new Error('无法打开截图缓存数据库'));
+    };
+    req.onblocked = () => {
+      dbPromise = null;
+      reject(new Error('截图缓存数据库被阻塞'));
+    };
+  });
+  return dbPromise;
+}
+
+async function idbGet(storeName, key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([storeName], 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('读取缓存失败'));
+  });
+}
+
+async function idbDeleteSession(id, pages) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['sessions', 'frames'], 'readwrite');
+    tx.objectStore('sessions').delete(id);
+    const frames = tx.objectStore('frames');
+    for (let i = 0; i < pages; i += 1) {
+      frames.delete(`${id}:${i}`);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('清理缓存失败'));
+    tx.onabort = () => reject(tx.error || new Error('清理缓存被中止'));
+  });
+}
 
 /* ---------------------------------------------------------------- utils */
 
@@ -36,6 +106,53 @@ function loadImage(url) {
     img.onerror = () => reject(new Error('图片数据损坏'));
     img.src = url;
   });
+}
+
+async function decodeFrame(frame) {
+  const input = frame && (frame.blob || frame.url);
+  if (!input) throw new Error('图片数据缺失');
+  if (input instanceof Blob) {
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bmp = await createImageBitmap(input);
+        return {
+          source: bmp,
+          width: bmp.width,
+          height: bmp.height,
+          close: () => {
+            try { bmp.close(); } catch (_) {}
+          }
+        };
+      } catch (e) {
+        /* 回退到 Image 解码 */
+      }
+    }
+    const objUrl = URL.createObjectURL(input);
+    try {
+      const img = await loadImage(objUrl);
+      return {
+        source: img,
+        width: img.naturalWidth,
+        height: img.naturalHeight,
+        close: () => {
+          img.src = '';
+          URL.revokeObjectURL(objUrl);
+        }
+      };
+    } catch (e) {
+      URL.revokeObjectURL(objUrl);
+      throw e;
+    }
+  }
+  const img = await loadImage(input);
+  return {
+    source: img,
+    width: img.naturalWidth,
+    height: img.naturalHeight,
+    close: () => {
+      img.src = '';
+    }
+  };
 }
 
 function fitFactor(w, h) {
@@ -52,14 +169,19 @@ function setProgress(ratio, text) {
 
 function fail(message) {
   const box = $('loading');
+  box.hidden = false;
   box.classList.remove('done');
   box.classList.add('error');
   $('loadingText').textContent = message;
-  const btn = document.createElement('button');
-  btn.textContent = '关闭此标签页';
-  btn.style.marginTop = '4px';
-  btn.onclick = () => window.close();
-  (box.querySelector('.lcard') || box).appendChild(btn);
+  const card = box.querySelector('.lcard') || box;
+  if (!card.querySelector('.closeErrBtn')) {
+    const btn = document.createElement('button');
+    btn.className = 'closeErrBtn';
+    btn.textContent = '关闭此标签页';
+    btn.style.marginTop = '4px';
+    btn.onclick = () => window.close();
+    card.appendChild(btn);
+  }
 }
 
 let toastTimer = 0;
@@ -78,21 +200,16 @@ function toast(text, type, ms) {
 async function boot() {
   if (!sessionId) return fail('缺少截图会话参数，请重新截图。');
 
-  let all = {};
+  let meta = null;
   try {
-    all = await chrome.storage.local.get(null);
+    meta = await idbGet('sessions', sessionId);
   } catch (e) {
     return fail('读取截图数据失败：' + e.message);
   }
 
-  const meta = all['ls:meta:' + sessionId];
-  if (!meta) return fail('找不到本次截图的数据。可能是扩展被重新加载，请重新截图。');
-
-  const keys = Object.keys(all)
-    .filter((k) => k.startsWith('ls:f:' + sessionId + ':'))
-    .sort((a, b) => Number(a.split(':').pop()) - Number(b.split(':').pop()));
-  const frames = keys.map((k) => all[k]).filter((f) => f && f.url);
-  if (!frames.length) return fail('没有采集到画面，请重新截图。');
+  if (!meta || !meta.pages) {
+    return fail('找不到本次截图的数据。可能是扩展被重新加载，请重新截图。');
+  }
 
   state.meta = meta;
   $('title').textContent = meta.title || '长截图';
@@ -101,8 +218,11 @@ async function boot() {
 
   try {
     setProgress(0.05, '正在解码画面…');
-    const first = await loadImage(frames[0].url);
-    const scale = first.naturalWidth / (meta.frameW || first.naturalWidth);
+    let f0 = await idbGet('frames', `${sessionId}:0`);
+    if (!f0 || (!f0.blob && !f0.url)) throw new Error('没有采集到画面，请重新截图。');
+
+    let first = await decodeFrame(f0);
+    const scale = first.width / (meta.frameW || first.width);
 
     const rawW = Math.max(1, Math.round(meta.outW * scale));
     const rawH = Math.max(1, Math.round(meta.outH * scale));
@@ -123,33 +243,49 @@ async function boot() {
     ctx.fillRect(0, 0, outW, outH);
 
     const ds = scale * k;
-    const paint = (img, f) => {
+    const paint = (source, f) => {
       const sx = f.src.x * scale;
       const sy = f.src.y * scale;
       const sw = Math.max(1, f.src.w * scale);
       const sh = Math.max(1, f.src.h * scale);
-      ctx.drawImage(img, sx, sy, sw, sh, 0, f.dy * ds, sw * k, sh * k);
+      ctx.drawImage(source, sx, sy, sw, sh, 0, f.dy * ds, sw * k, sh * k);
     };
 
-    paint(first, frames[0]);
-    first.src = '';
+    try {
+      paint(first.source, f0);
+    } finally {
+      first.close();
+      first = null;
+      f0 = null;
+    }
 
-    for (let i = 1; i < frames.length; i += 1) {
-      setProgress(0.1 + (i / frames.length) * 0.85, `正在合成 ${i + 1}/${frames.length} 帧…`);
+    for (let i = 1; i < meta.pages; i += 1) {
+      setProgress(0.1 + (i / meta.pages) * 0.85, `正在合成 ${i + 1}/${meta.pages} 帧…`);
       // 让出主线程，保证进度条与动画不卡死
       if (i % 2 === 0) await new Promise((r) => setTimeout(r, 0));
-      const img = await loadImage(frames[i].url);
-      paint(img, frames[i]);
-      img.src = '';
+      let fi = await idbGet('frames', `${sessionId}:${i}`);
+      if (!fi || (!fi.blob && !fi.url)) throw new Error(`第 ${i + 1} 帧数据缺失`);
+      const decoded = await decodeFrame(fi);
+      try {
+        paint(decoded.source, fi);
+      } finally {
+        decoded.close();
+        fi = null;
+      }
     }
+
+    await idbDeleteSession(sessionId, meta.pages).catch(() => {});
 
     state.base = canvas;
     state.baseW = outW;
     state.baseH = outH;
     state.crop = { x: 0, y: 0, w: outW, h: outH };
+    state.renderedCropKey = '';
+    cachedExport = null;
 
     setProgress(1, '完成');
     $('loading').classList.add('done');
+    $('loading').hidden = true;
     render();
     window.focus();
   } catch (e) {
@@ -159,25 +295,62 @@ async function boot() {
 
 /* --------------------------------------------------------------- render */
 
+function isFullCrop() {
+  const { crop, baseW, baseH } = state;
+  return Boolean(crop && crop.x === 0 && crop.y === 0 && crop.w === baseW && crop.h === baseH);
+}
+
+function mountViewCanvas(target) {
+  const current = $('view');
+  if (current === target) return;
+  target.id = 'view';
+  if (current && current.parentNode) {
+    current.removeAttribute('id');
+    current.parentNode.replaceChild(target, current);
+  } else {
+    $('paper').insertBefore(target, $('cropLayer'));
+  }
+}
+
+function releasePreviewCanvas() {
+  if (!state.previewCanvas) return;
+  state.previewCanvas.width = 0;
+  state.previewCanvas.height = 0;
+  state.previewCanvas = null;
+  state.renderedCropKey = '';
+}
+
 function render() {
   const { base, crop } = state;
   if (!base || !crop) return;
-  const view = $('view');
   const stage = $('stage');
 
   const avail = Math.max(240, stage.clientWidth - 44);
   const cssW = state.zoom === 'fit' ? Math.min(avail, crop.w) : crop.w;
 
-  const intrinsicW = Math.max(1, Math.min(crop.w, 1800));
-  const ratio = intrinsicW / crop.w;
-  const intrinsicH = Math.max(1, Math.round(crop.h * ratio));
+  if (isFullCrop()) {
+    mountViewCanvas(base);
+    releasePreviewCanvas();
+    base.style.width = Math.round(cssW) + 'px';
+  } else {
+    const intrinsicW = Math.max(1, Math.min(crop.w, 1800));
+    const ratio = intrinsicW / crop.w;
+    const intrinsicH = Math.max(1, Math.round(crop.h * ratio));
+    const cropKey = `${crop.x},${crop.y},${crop.w},${crop.h},${intrinsicW},${intrinsicH}`;
 
-  view.width = intrinsicW;
-  view.height = intrinsicH;
-  const ctx = view.getContext('2d', { alpha: false });
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(base, crop.x, crop.y, crop.w, crop.h, 0, 0, intrinsicW, intrinsicH);
-  view.style.width = Math.round(cssW) + 'px';
+    if (!state.previewCanvas) state.previewCanvas = document.createElement('canvas');
+    const view = state.previewCanvas;
+    if (state.renderedCropKey !== cropKey) {
+      view.width = intrinsicW;
+      view.height = intrinsicH;
+      const ctx = view.getContext('2d', { alpha: false });
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(base, crop.x, crop.y, crop.w, crop.h, 0, 0, intrinsicW, intrinsicH);
+      state.renderedCropKey = cropKey;
+    }
+    mountViewCanvas(view);
+    view.style.width = Math.round(cssW) + 'px';
+  }
 
   const chips = [`${crop.w} × ${crop.h}`];
   if (state.meta && state.meta.pages) chips.push(state.meta.pages + ' 帧');
@@ -264,6 +437,7 @@ function bindCrop() {
       w: Math.round(w),
       h: Math.round(h)
     };
+    cachedExport = null;
     exitCrop();
     render();
     toast(`已裁剪到 ${state.crop.w} × ${state.crop.h}`, 'ok');
@@ -280,27 +454,42 @@ function bindCrop() {
 async function makeBlob(fmt) {
   const { base, crop } = state;
   const useFmt = fmt || state.fmt;
-  const k = fitFactor(crop.w, crop.h);
-  const W = Math.max(1, Math.round(crop.w * k));
-  const H = Math.max(1, Math.round(crop.h * k));
+  const mime = useFmt === 'jpg' ? 'image/jpeg' : 'image/png';
+  const quality = useFmt === 'jpg' ? state.quality : undefined;
+  const cacheKey = `${useFmt}:${useFmt === 'jpg' ? state.quality : 1}:${crop.x},${crop.y},${crop.w},${crop.h}`;
+  if (cachedExport && cachedExport.key === cacheKey) return cachedExport.blob;
 
-  const c = document.createElement('canvas');
-  c.width = W;
-  c.height = H;
-  const ctx = c.getContext('2d', { alpha: useFmt === 'png' });
-  if (useFmt === 'jpg') {
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, W, H);
+  let blob;
+  if (isFullCrop()) {
+    // 未裁剪时直接复用 base（已在 boot() 中铺满白色背景并限制像素上限），避免分配第 3 张巨型画布
+    blob = await new Promise((resolve) => {
+      base.toBlob(resolve, mime, quality);
+    });
+  } else {
+    const k = fitFactor(crop.w, crop.h);
+    const W = Math.max(1, Math.round(crop.w * k));
+    const H = Math.max(1, Math.round(crop.h * k));
+
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext('2d', { alpha: useFmt === 'png' });
+    if (useFmt === 'jpg') {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(base, crop.x, crop.y, crop.w, crop.h, 0, 0, W, H);
+
+    blob = await new Promise((resolve) => {
+      c.toBlob(resolve, mime, quality);
+    });
+    c.width = 0;
+    c.height = 0;
   }
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(base, crop.x, crop.y, crop.w, crop.h, 0, 0, W, H);
 
-  const blob = await new Promise((resolve) => {
-    c.toBlob(resolve, useFmt === 'jpg' ? 'image/jpeg' : 'image/png', useFmt === 'jpg' ? state.quality : undefined);
-  });
-  c.width = 0;
-  c.height = 0;
   if (!blob) throw new Error('图片尺寸过大，请先裁剪再试');
+  cachedExport = { key: cacheKey, blob };
   return blob;
 }
 
@@ -446,6 +635,7 @@ function bindUI() {
   $('btnReset').addEventListener('click', () => {
     if (!state.base) return;
     state.crop = { x: 0, y: 0, w: state.baseW, h: state.baseH };
+    cachedExport = null;
     render();
     toast('已恢复完整画面', 'ok', 1800);
   });
@@ -520,6 +710,17 @@ function bindUI() {
       if (state.base) render();
       if (cropping) exitCrop();
     }, 160);
+  });
+
+  window.addEventListener('pagehide', (e) => {
+    if (e.persisted) return;
+    cachedExport = null;
+    releasePreviewCanvas();
+    if (state.base) {
+      state.base.width = 0;
+      state.base.height = 0;
+      state.base = null;
+    }
   });
 
   bindCrop();

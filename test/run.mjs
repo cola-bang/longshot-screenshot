@@ -7,7 +7,19 @@ import os from 'node:os';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const EXT = path.join(ROOT, 'longshot');
 const OUT = path.join(ROOT, 'test', 'out');
-const CHROME = path.join(os.homedir(), 'AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe');
+const WIN_CHROME = path.join(os.homedir(), 'AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe');
+const CHROME = [
+  WIN_CHROME,
+  process.env.CHROME_PATH,
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/Applications/Helium.app/Contents/MacOS/Helium',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser'
+]
+  .filter(Boolean)
+  .find((p) => fs.existsSync(p));
 const PORT = 8788;
 
 fs.mkdirSync(OUT, { recursive: true });
@@ -46,10 +58,11 @@ manifest.host_permissions = ['<all_urls>'];
 fs.writeFileSync(path.join(TEST_EXT, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
 const context = await chromium.launchPersistentContext(profile, {
-  executablePath: CHROME,
+  ...(CHROME ? { executablePath: CHROME } : {}),
   headless: true,
   viewport: { width: 1000, height: 800 },
   args: [
+    '--headless=new',
     `--disable-extensions-except=${TEST_EXT}`,
     `--load-extension=${TEST_EXT}`,
     '--no-first-run',
@@ -80,6 +93,10 @@ log('扩展已加载:', extId);
 const page = await context.newPage();
 await page.goto(`http://127.0.0.1:${PORT}/demo.html`, { waitUntil: 'load' });
 await page.waitForTimeout(800);
+for (const p of context.pages()) {
+  if (p !== page) await p.close().catch(() => {});
+}
+await page.bringToFront();
 
 const info = await page.evaluate(() => ({
   h: document.documentElement.scrollHeight,
@@ -88,23 +105,47 @@ const info = await page.evaluate(() => ({
 }));
 log(`测试页高度 ${info.h}px, 视口 ${info.vh}px, 区块 ${info.sections.length} 个`);
 
-const tabId = await sw.evaluate(async () => {
-  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  return tabs && tabs[0] ? tabs[0].id : null;
-});
+const tabId = await sw.evaluate(async (urlPrefix) => {
+  const all = await chrome.tabs.query({});
+  const hit = all.find((t) => t.url && t.url.startsWith(urlPrefix));
+  return hit ? hit.id : (all[0] && all[0].id);
+}, `http://127.0.0.1:${PORT}/`);
 if (tabId == null) throw new Error('找不到目标 tabId');
 log('目标 tabId =', tabId);
 
 async function trigger(mode, settings = {}) {
+  await page.bringToFront();
   const viewerPromise = context.waitForEvent('page', { timeout: 150000 });
-  await sw.evaluate(
-    async ({ tabId, mode, settings }) => {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-      chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode, settings });
-    },
-    { tabId, mode, settings }
-  );
-  const viewer = await viewerPromise;
+  const startPromise = sw
+    .evaluate(
+      async ({ tabId, mode, settings }) => {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+        return await new Promise((resolve) => {
+          chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode, settings }, (res) => {
+            const err = chrome.runtime.lastError;
+            if (err) resolve({ ok: false, error: err.message });
+            else resolve(res || { ok: false, error: 'LS_START 无响应' });
+          });
+        });
+      },
+      { tabId, mode, settings }
+    )
+    .catch((e) => ({ ok: false, error: e && e.message ? e.message : String(e) }));
+
+  const failFast = startPromise.then((res) => {
+    if (!res || res.ok === false) {
+      throw new Error(`LS_START(${mode}) 失败: ${(res && res.error) || '未知错误'}`);
+    }
+    return new Promise(() => {});
+  });
+
+  let viewer;
+  try {
+    viewer = await Promise.race([viewerPromise, failFast]);
+  } catch (e) {
+    viewerPromise.catch(() => {});
+    throw e;
+  }
   await viewer.waitForLoadState('domcontentloaded');
   await viewer.waitForFunction(() => window.__longshot && window.__longshot.base, null, { timeout: 120000 });
   return viewer;
@@ -160,6 +201,42 @@ if (bad.length) {
 const expectH = Math.round(info.h * (r1.baseH / r1.outH));
 if (Math.abs(r1.baseH - expectH) > 6) fail(`高度不符: 拼接 ${r1.baseH} vs 预期 ${expectH}`);
 else log(`高度校验通过 (${r1.baseH} ≈ ${expectH})`);
+
+/* ------------------------- 1.2 性能不变量校验 ------------------------- */
+{
+  const storageKeys = await sw.evaluate(async () => {
+    const all = await chrome.storage.local.get(null);
+    return Object.keys(all).filter((k) => k.startsWith('ls:f:') || k.startsWith('ls:meta:'));
+  });
+  if (storageKeys.length) fail(`chrome.storage.local 仍有残留帧/元数据键: ${storageKeys.length}`);
+  else log('storage.local 零帧残留校验通过');
+
+  const perfCheck = await v1.evaluate(async () => {
+    const singleCanvas = document.getElementById('view') === window.__longshot.base;
+    const loadingDisplay = getComputedStyle(document.getElementById('loading')).display;
+    const idbFrameCount = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('longshot-db', 1);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction(['frames'], 'readonly');
+        const cntReq = tx.objectStore('frames').count();
+        cntReq.onsuccess = () => {
+          db.close();
+          resolve(cntReq.result);
+        };
+        cntReq.onerror = () => reject(cntReq.error);
+      };
+      req.onerror = () => reject(req.error);
+    });
+    return { singleCanvas, loadingDisplay, idbFrameCount };
+  });
+  if (perfCheck.idbFrameCount !== 0) fail(`IndexedDB frames 表未清空，残留 ${perfCheck.idbFrameCount} 条`);
+  else log('IndexedDB 帧数据即刻释放校验通过');
+  if (!perfCheck.singleCanvas) fail('未裁剪态预览画布未直接复用 base（存在重复画布内存）');
+  else log('单画布零冗余内存校验通过');
+  if (perfCheck.loadingDisplay !== 'none') fail(`loading 遮罩完成后 display=${perfCheck.loadingDisplay}，可能存在后台动画空转`);
+  else log('loading 遮罩停止渲染校验通过');
+}
 
 await saveBase(v1, 'full.png');
 await v1.screenshot({ path: path.join(OUT, 'viewer.png') });
@@ -384,6 +461,31 @@ await popup.evaluate(() => {
 });
 await popup.screenshot({ path: path.join(OUT, 'popup.png'), fullPage: true });
 log('popup 截图已保存');
+
+{
+  const uiMeta = await popup.evaluate(() => ({
+    kbd: document.querySelector('#btnFull kbd')?.textContent?.trim(),
+    ver: document.querySelector('.ver')?.textContent?.trim()
+  }));
+  if (uiMeta.kbd !== 'Alt+Shift+S') fail(`popup 快捷键文本异常: ${uiMeta.kbd}`);
+  if (uiMeta.ver !== 'v1.2') fail(`popup 版本文本异常: ${uiMeta.ver}`);
+
+  await popup.locator('label.switch').first().click();
+  await popup.waitForTimeout(200);
+  const storageCheck = await popup.evaluate(async () => {
+    const legacy = localStorage.getItem('ls-popup-settings');
+    const asyncSaved = await new Promise((resolve) => {
+      chrome.storage.local.get('ls:settings', (res) => resolve(res && res['ls:settings']));
+    });
+    return { legacy, asyncSaved };
+  });
+  if (storageCheck.legacy !== null) fail(`popup 仍写入了同步 localStorage: ${storageCheck.legacy}`);
+  if (!storageCheck.asyncSaved || storageCheck.asyncSaved.hideSticky !== false) {
+    fail(`popup 异步设置未写入 chrome.storage.local: ${JSON.stringify(storageCheck.asyncSaved)}`);
+  } else {
+    log('popup 零阻塞渲染与异步设置存储校验通过');
+  }
+}
 
 /* ------------------------------ teardown --------------------------------- */
 await context.close();
