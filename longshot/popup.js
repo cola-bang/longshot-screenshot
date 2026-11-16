@@ -1,30 +1,60 @@
 /* LongShot · popup
- * 打开即渲染（同步读 localStorage），不等待后台；点击后用超时保护给出明确反馈。
+ * 首帧零阻塞渲染：不在首屏同步读取 localStorage 或等待后台，首帧绘制后再异步同步设置并预热后台。
  */
 'use strict';
 
 const DEFAULTS = { hideSticky: true, preload: true };
-const LS_KEY = 'ls-popup-settings';
-const START_TIMEOUT = 6000;
+const STORAGE_KEY = 'ls:settings';
+const LEGACY_LS_KEY = 'ls-popup-settings';
+const START_TIMEOUT = 8000;
+
+const BLOCKED_SCHEME = /^(chrome|edge|brave|opera|vivaldi|about|devtools|view-source|chrome-extension|moz-extension|edge-extension|chrome-untrusted):/i;
+const BLOCKED_HOST = /^https:\/\/(chrome\.google\.com\/webstore|chromewebstore\.google\.com|addons\.mozilla\.org|microsoftedge\.microsoft\.com\/addons)/i;
 
 const $ = (id) => document.getElementById(id);
 
 let currentTab = null;
 let starting = false;
+let userToggled = false;
 
-function loadSettings() {
-  try {
-    return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(LS_KEY) || '{}'));
-  } catch (e) {
-    return Object.assign({}, DEFAULTS);
-  }
+function blockedReason(url) {
+  const u = String(url || '');
+  if (BLOCKED_SCHEME.test(u)) return '浏览器内置页面（设置、扩展商店等）不允许注入脚本，请切换到普通网页。';
+  if (BLOCKED_HOST.test(u)) return '浏览器扩展商店页面受保护，无法截图。';
+  return null;
+}
+
+function readFormSettings() {
+  return {
+    hideSticky: $('hideSticky').checked,
+    preload: $('preload').checked
+  };
+}
+
+function applySettings(settings) {
+  $('hideSticky').checked = settings.hideSticky !== false;
+  $('preload').checked = settings.preload !== false;
+}
+
+function storageGet(key) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.storage.local.get(key, (res) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(res || {});
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
 }
 
 function saveSettings(obj) {
   try {
-    localStorage.setItem(LS_KEY, JSON.stringify(obj));
+    chrome.storage.local.set({ [STORAGE_KEY]: obj }, () => void chrome.runtime.lastError);
   } catch (e) {
-    /* 忽略：隐私模式下可能不可写 */
+    /* 忽略：隐私模式或上下文异常时 */
   }
 }
 
@@ -61,7 +91,7 @@ function sendOnce(msg, timeout) {
 // 这类错误重试即可恢复；超时类错误不重试，避免重复触发截图。
 const RETRYABLE = /Receiving end does not exist|message port closed|Could not establish connection|Extension context invalidated/i;
 
-async function send(msg, timeout, attempts = 3) {
+async function send(msg, timeout, attempts = 5) {
   let lastErr = null;
   for (let i = 0; i < (attempts || 1); i += 1) {
     try {
@@ -69,10 +99,35 @@ async function send(msg, timeout, attempts = 3) {
     } catch (e) {
       lastErr = e;
       if (!RETRYABLE.test(e.message || '')) throw e;
-      await new Promise((r) => setTimeout(r, 120 * (i + 1)));
+      await new Promise((r) => setTimeout(r, 140 * (i + 1)));
     }
   }
   throw lastErr;
+}
+
+async function queryActiveTabDirect() {
+  try {
+    const tabs = await new Promise((resolve, reject) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, (res) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(res);
+      });
+    });
+    const tab = tabs && tabs[0];
+    if (tab && tab.id != null) {
+      return {
+        ok: true,
+        tabId: tab.id,
+        title: tab.title,
+        url: tab.url,
+        error: blockedReason(tab.url)
+      };
+    }
+  } catch (e) {
+    /* 回退到后台查询 */
+  }
+  return send({ type: 'GET_ACTIVE_TAB' }, 4000);
 }
 
 async function start(mode, btn) {
@@ -87,10 +142,7 @@ async function start(mode, btn) {
   showAlert('');
 
   try {
-    const payload = {
-      hideSticky: $('hideSticky').checked,
-      preload: $('preload').checked
-    };
+    const payload = readFormSettings();
     saveSettings(payload);
 
     const res = await send(
@@ -109,35 +161,41 @@ async function start(mode, btn) {
   }
 }
 
-async function init() {
-  const settings = loadSettings();
-  $('hideSticky').checked = settings.hideSticky !== false;
-  $('preload').checked = settings.preload !== false;
-
-  const verEl = document.querySelector('.ver');
-  if (verEl) {
-    verEl.textContent = 'v' + chrome.runtime.getManifest().version.split('.').slice(0, 2).join('.');
-  }
-
-  document.querySelectorAll('[data-mode]').forEach((b) => {
-    b.addEventListener('click', () => start(b.dataset.mode, b));
-  });
-  $('hideSticky').addEventListener('change', () =>
-    saveSettings({ hideSticky: $('hideSticky').checked, preload: $('preload').checked })
-  );
-  $('preload').addEventListener('change', () =>
-    saveSettings({ hideSticky: $('hideSticky').checked, preload: $('preload').checked })
-  );
-
-  // 提前唤醒 Service Worker，点击时就不用等冷启动
+function migrateLegacySettings() {
+  let legacy = null;
   try {
-    chrome.runtime.sendMessage({ type: 'PING' }, () => void chrome.runtime.lastError);
+    const raw = localStorage.getItem(LEGACY_LS_KEY);
+    if (raw) legacy = JSON.parse(raw);
+    localStorage.removeItem(LEGACY_LS_KEY);
   } catch (e) {
-    /* ignore */
+    /* 忽略：旧存储不可读或非 JSON */
   }
+  const merged = Object.assign({}, DEFAULTS, legacy && typeof legacy === 'object' ? legacy : null);
+  if (!userToggled) {
+    applySettings(merged);
+  }
+  saveSettings(userToggled ? readFormSettings() : merged);
+}
 
+async function hydrateSettings() {
   try {
-    const info = await send({ type: 'GET_ACTIVE_TAB' }, 4000);
+    const res = await storageGet(STORAGE_KEY);
+    const saved = res && res[STORAGE_KEY];
+    if (saved && typeof saved === 'object') {
+      if (!userToggled) {
+        applySettings(Object.assign({}, DEFAULTS, saved));
+      }
+      return;
+    }
+  } catch (e) {
+    /* 忽略读取失败，尝试迁移动作 */
+  }
+  setTimeout(migrateLegacySettings, 120);
+}
+
+async function hydrateActiveTab() {
+  try {
+    const info = await queryActiveTabDirect();
     if (info && info.ok !== false) {
       currentTab = info;
       let host = '';
@@ -155,9 +213,41 @@ async function init() {
       showAlert('后台尚未就绪，点击模式会自动重试');
     }
   } catch (e) {
-    console.warn('[LongShot] popup init failed:', e && e.message);
-    $('pageTitle').textContent = '后台尚未就绪';
+    console.warn('[LongShot] popup tab query failed:', e && e.message);
   }
+}
+
+function hydrateAfterPaint() {
+  hydrateSettings();
+  hydrateActiveTab();
+  // 首帧弹出后再温和唤醒 Service Worker，避免点击图标瞬间与首屏渲染抢占 CPU
+  setTimeout(() => {
+    try {
+      chrome.runtime.sendMessage({ type: 'PING' }, () => void chrome.runtime.lastError);
+    } catch (e) {
+      /* ignore */
+    }
+  }, 60);
+}
+
+function init() {
+  const verEl = document.querySelector('.ver');
+  if (verEl) {
+    const nextVer = 'v' + chrome.runtime.getManifest().version.split('.').slice(0, 2).join('.');
+    if (verEl.textContent !== nextVer) verEl.textContent = nextVer;
+  }
+
+  document.querySelectorAll('[data-mode]').forEach((b) => {
+    b.addEventListener('click', () => start(b.dataset.mode, b));
+  });
+  const onOptionChange = () => {
+    userToggled = true;
+    saveSettings(readFormSettings());
+  };
+  $('hideSticky').addEventListener('change', onOptionChange);
+  $('preload').addEventListener('change', onOptionChange);
+
+  requestAnimationFrame(() => setTimeout(hydrateAfterPaint, 0));
 }
 
 init();

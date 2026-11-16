@@ -14,7 +14,6 @@
   const MAX_CSS_HEIGHT = 20000; // 单张成图最大高度（CSS px）
   const MAX_FRAMES = 90;
   const UI_ATTR = 'data-longshot-ui';
-  const K_FRAME = (id, i) => `ls:f:${id}:${i}`;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const nextFrame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
@@ -43,35 +42,6 @@
     }
   }
 
-  function storageSet(obj) {
-    return new Promise((resolve, reject) => {
-      chrome.storage.local.set(obj, () => {
-        const err = chrome.runtime.lastError;
-        if (err) reject(new Error(err.message));
-        else resolve();
-      });
-    });
-  }
-
-  function storageGet(keys) {
-    return new Promise((resolve, reject) => {
-      chrome.storage.local.get(keys, (res) => {
-        const err = chrome.runtime.lastError;
-        if (err) reject(new Error(err.message));
-        else resolve(res || {});
-      });
-    });
-  }
-
-  function storageRemove(keys) {
-    return new Promise((resolve) => {
-      chrome.storage.local.remove(keys, () => {
-        void chrome.runtime.lastError;
-        resolve();
-      });
-    });
-  }
-
   /* ------------------------------------------------------------------ UI */
 
   const ui = (() => {
@@ -81,8 +51,10 @@
     let titleEl = null;
     let subEl = null;
     let barEl = null;
+    let fillEl = null;
     let toastEl = null;
     let toastTimer = 0;
+    let destroyTimer = 0;
 
     const CSS = `
       :host { all: initial; }
@@ -97,10 +69,9 @@
         min-width: 268px; max-width: 380px;
         padding: 11px 13px;
         border-radius: 14px;
-        background: rgba(15, 18, 25, .93);
+        background: rgba(15, 18, 25, .97);
         border: 1px solid rgba(255, 255, 255, .10);
         box-shadow: 0 14px 40px rgba(0, 0, 0, .38), 0 2px 6px rgba(0, 0, 0, .2);
-        -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
         font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         color: #e8edf7;
       }
@@ -125,7 +96,7 @@
         position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(8px);
         opacity: 0; transition: opacity .18s ease, transform .18s ease;
         max-width: 460px; padding: 10px 15px; border-radius: 11px;
-        background: rgba(15, 18, 25, .95); color: #eef3ff;
+        background: rgba(15, 18, 25, .97); color: #eef3ff;
         border: 1px solid rgba(255,255,255,.10); box-shadow: 0 12px 34px rgba(0,0,0,.4);
         font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         text-align: center;
@@ -134,7 +105,18 @@
       .toast.err { border-color: rgba(255, 106, 106, .45); }
     `;
 
+    function destroy() {
+      clearTimeout(toastTimer);
+      clearTimeout(destroyTimer);
+      toastTimer = 0;
+      destroyTimer = 0;
+      if (host) host.remove();
+      host = root = card = titleEl = subEl = barEl = fillEl = toastEl = null;
+    }
+
     function ensure() {
+      clearTimeout(destroyTimer);
+      destroyTimer = 0;
       if (host && host.isConnected) return;
       host = document.createElement('div');
       host.setAttribute(UI_ATTR, '1');
@@ -165,6 +147,7 @@
       titleEl = root.getElementById('t');
       subEl = root.getElementById('s');
       barEl = root.getElementById('bar');
+      fillEl = root.getElementById('fill');
       toastEl = root.getElementById('toast');
       root.getElementById('esc').addEventListener('click', () => {
         window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -185,7 +168,7 @@
         if (s != null) subEl.textContent = s;
         if (ratio != null) {
           barEl.hidden = false;
-          root.getElementById('fill').style.width = Math.max(0, Math.min(1, ratio)) * 100 + '%';
+          fillEl.style.width = Math.max(0, Math.min(1, ratio)) * 100 + '%';
         }
       },
       hide() {
@@ -200,12 +183,15 @@
         toastEl.textContent = text;
         toastEl.className = 'toast on' + (isError ? ' err' : '');
         clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => toastEl.classList.remove('on'), ms || 2600);
+        clearTimeout(destroyTimer);
+        toastTimer = setTimeout(() => {
+          if (toastEl) toastEl.classList.remove('on');
+          destroyTimer = setTimeout(() => {
+            if (!busy) destroy();
+          }, 300);
+        }, ms || 2600);
       },
-      destroy() {
-        if (host) host.remove();
-        host = root = card = titleEl = subEl = barEl = toastEl = null;
-      }
+      destroy
     };
   })();
 
@@ -264,6 +250,7 @@
       let last = { x: 0, y: 0 };
       let dragging = false;
       let rafId = 0;
+      let drawRaf = 0;
       let autoDir = 0;
 
       const draw = () => {
@@ -296,6 +283,14 @@
         }
       };
 
+      const scheduleDraw = () => {
+        if (drawRaf) return;
+        drawRaf = requestAnimationFrame(() => {
+          drawRaf = 0;
+          if (dragging) draw();
+        });
+      };
+
       // 拖到上下边缘时自动滚页：选区按页面坐标记，滚多少就延伸多少
       const tick = () => {
         if (!dragging) return;
@@ -319,6 +314,8 @@
       const cleanup = (value) => {
         dragging = false;
         cancelAnimationFrame(rafId);
+        cancelAnimationFrame(drawRaf);
+        drawRaf = 0;
         window.removeEventListener('keydown', onKey, true);
         window.removeEventListener('scroll', onScroll, true);
         host.remove();
@@ -333,7 +330,7 @@
         }
       };
       const onScroll = () => {
-        if (dragging) draw();
+        if (dragging) scheduleDraw();
       };
 
       layer.addEventListener('pointerdown', (e) => {
@@ -356,13 +353,15 @@
           x: clampX(e.clientX),
           y: Math.max(0, Math.min(vh(), e.clientY)) + window.scrollY
         };
-        draw();
+        scheduleDraw();
       });
 
       const release = () => {
         if (!dragging) return;
         dragging = false;
         cancelAnimationFrame(rafId);
+        cancelAnimationFrame(drawRaf);
+        drawRaf = 0;
         autoDir = 0;
         const x1 = Math.min(anchor.x, cur.x);
         const y1 = Math.min(anchor.y, cur.y);
@@ -401,6 +400,8 @@
       const hl = root.querySelector('.hl');
       const tag = root.querySelector('.tag');
       let target = null;
+      let moveRaf = 0;
+      let lastPos = null;
 
       const describe = (el) => {
         const id = el.id ? '#' + el.id : '';
@@ -408,6 +409,12 @@
           ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.')
           : '';
         return `${el.tagName.toLowerCase()}${id}${cls}`.slice(0, 48);
+      };
+
+      const resolveTarget = (x, y) => {
+        const el = document.elementFromPoint(x, y);
+        if (!el || el === host || host.contains(el) || el.hasAttribute(UI_ATTR)) return null;
+        return el;
       };
 
       const paint = () => {
@@ -422,13 +429,21 @@
       };
 
       const onMove = (e) => {
-        const el = document.elementFromPoint(e.clientX, e.clientY);
-        if (!el || el === host || host.contains(el) || el.hasAttribute(UI_ATTR)) return;
-        target = el;
-        paint();
+        lastPos = { x: e.clientX, y: e.clientY };
+        if (moveRaf) return;
+        moveRaf = requestAnimationFrame(() => {
+          moveRaf = 0;
+          if (!lastPos) return;
+          const el = resolveTarget(lastPos.x, lastPos.y);
+          if (!el || el === target) return;
+          target = el;
+          paint();
+        });
       };
 
       const cleanup = (value) => {
+        cancelAnimationFrame(moveRaf);
+        moveRaf = 0;
         window.removeEventListener('mousemove', onMove, true);
         window.removeEventListener('click', onClick, true);
         window.removeEventListener('keydown', onKey, true);
@@ -440,6 +455,8 @@
       const onClick = (e) => {
         e.preventDefault();
         e.stopPropagation();
+        const hit = resolveTarget(e.clientX, e.clientY);
+        if (hit) target = hit;
         if (!target) {
           cleanup(null);
           return;
@@ -498,6 +515,7 @@
     const se = document.scrollingElement || document.documentElement;
     const vh = document.documentElement.clientHeight || window.innerHeight;
     const max = Math.min(se.scrollHeight, MAX_CSS_HEIGHT);
+    if (max <= vh + 8) return;
     const stepSize = Math.max(220, Math.floor(vh * 0.85));
     let steps = 0;
     for (let y = 0; y < max && steps < 40; y += stepSize) {
@@ -530,31 +548,54 @@
     return best;
   }
 
+  const SKIP_TAGS = new Set(['HEAD', 'SCRIPT', 'STYLE', 'LINK', 'META', 'NOSCRIPT', 'TEMPLATE']);
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
   function hideFloating(rootEl, exclude) {
-    const saved = [];
     const vh = window.innerHeight;
     const vw = window.innerWidth;
-    let scanned = 0;
-    for (const el of rootEl.querySelectorAll('*')) {
-      if (saved.length >= 300 || scanned >= 8000) break;
-      if (el.hasAttribute(UI_ATTR)) continue;
-      if (exclude && el === exclude) continue;
+    const toHide = [];
+    let visited = 0;
+    let inViewport = 0;
+
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_ELEMENT, {
+      acceptNode(el) {
+        if (el.hasAttribute(UI_ATTR)) return NodeFilter.FILTER_REJECT;
+        if (exclude && el === exclude) return NodeFilter.FILTER_SKIP;
+        if (SKIP_TAGS.has(el.tagName)) return NodeFilter.FILTER_REJECT;
+        if (el.namespaceURI === SVG_NS && el.localName !== 'svg') return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    // 第一阶段：只读收集，避免循环内读写交替引发强制同步回流
+    let el;
+    while ((el = walker.nextNode())) {
+      if (visited >= 15000 || inViewport >= 5000 || toHide.length >= 300) break;
+      visited += 1;
       const tag = el.tagName;
       if (tag === 'HTML' || tag === 'BODY') continue;
       const r = el.getBoundingClientRect();
       if (r.width < 2 || r.height < 2) continue;
       if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
-      scanned += 1;
+      inViewport += 1;
       const cs = getComputedStyle(el);
       if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
       if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
-      saved.push([el, el.style.getPropertyValue('visibility'), el.style.getPropertyPriority('visibility')]);
-      el.style.setProperty('visibility', 'hidden', 'important');
+      toHide.push(el);
     }
+
+    // 第二阶段：批量写入样式
+    const saved = [];
+    for (const node of toHide) {
+      saved.push([node, node.style.getPropertyValue('visibility'), node.style.getPropertyPriority('visibility')]);
+      node.style.setProperty('visibility', 'hidden', 'important');
+    }
+
     return () => {
-      for (const [el, v, prio] of saved) {
-        if (v) el.style.setProperty('visibility', v, prio);
-        else el.style.removeProperty('visibility');
+      for (const [node, v, prio] of saved) {
+        if (v) node.style.setProperty('visibility', v, prio);
+        else node.style.removeProperty('visibility');
       }
     };
   }
@@ -584,12 +625,11 @@
     await sleep(settings.settle == null ? 130 : settings.settle);
   }
 
-  async function takeFrame() {
+  async function captureAndStoreFrame(id, index, dy, src) {
     if (document.visibilityState !== 'visible') {
       throw new Error('标签页切到后台，截图已中断');
     }
-    const res = await msg({ type: 'CAPTURE_FRAME' });
-    return res.dataUrl;
+    await msg({ type: 'CAPTURE_FRAME', id, index, dy, src });
   }
 
   function elementClientRect(el) {
@@ -651,11 +691,7 @@
         notify(`${Math.min(index + 1, ys.length)}/${ys.length}`);
         ui.update(`正在截取 ${index + 1}/${ys.length}`, '请勿切换标签页', (index + 1) / ys.length);
 
-        const url = await takeFrame();
-
-        await storageSet({
-          [K_FRAME(id, index)]: { dy, src: { x: crop.x, y: crop.y, w: crop.w, h: crop.h }, url }
-        });
+        await captureAndStoreFrame(id, index, dy, { x: crop.x, y: crop.y, w: crop.w, h: crop.h });
 
         outH = Math.max(outH, dy + crop.h);
         index += 1;
@@ -697,7 +733,6 @@
       ts: Date.now()
     };
     if (meta.outW < 2 || meta.outH < 2) throw new Error('截图区域无效');
-    await storageSet({ ['ls:meta:' + id]: meta });
     await msg({ type: 'CAPTURE_COMPLETE', id, meta });
   }
 
@@ -779,8 +814,7 @@
     try {
       await settle(settings);
       notify('1/1');
-      const url = await takeFrame();
-      await storageSet({ [K_FRAME(id, 0)]: { dy: 0, src: rect, url } });
+      await captureAndStoreFrame(id, 0, 0, rect);
       return { pages: 1, outW: rect.w, outH: rect.h, frameW: vp.iw };
     } finally {
       ui.setHidden(false);
@@ -844,8 +878,7 @@
           h: Math.round(sBottom - sTop)
         };
         notify(`截取中 ${index + 1}`);
-        const url = await takeFrame();
-        await storageSet({ [K_FRAME(id, index)]: { dy: Math.round(sTop - top), src, url } });
+        await captureAndStoreFrame(id, index, Math.round(sTop - top), src);
         index += 1;
 
         if (sBottom >= end) break;
@@ -872,10 +905,8 @@
     const saved = { x: window.scrollX, y: window.scrollY };
     ui.destroy();
     try {
-      // 每次开始前清空上一轮残留的帧数据（最多只保留一份会话）
-      const all = await storageGet(null).catch(() => ({}));
-      const stale = Object.keys(all).filter((k) => k.startsWith('ls:f:') || k.startsWith('ls:meta:'));
-      if (stale.length) await storageRemove(stale);
+      // 每次开始前由后台直接清空 IndexedDB 残留帧数据
+      await msg({ type: 'CAPTURE_INIT', id });
 
       let result = null;
       if (mode === 'visible') {
@@ -922,7 +953,7 @@
           : raw;
       ui.toast(friendly, true, 4200);
       try {
-        chrome.runtime.sendMessage({ type: 'CAPTURE_FAILED' }, () => void chrome.runtime.lastError);
+        chrome.runtime.sendMessage({ type: 'CAPTURE_FAILED', id }, () => void chrome.runtime.lastError);
       } catch (_) {
         /* ignore */
       }
@@ -931,7 +962,12 @@
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (!message || message.type !== 'LS_START') return undefined;
+    if (!message) return undefined;
+    if (message.type === 'LS_PING') {
+      sendResponse({ ok: true, busy });
+      return undefined;
+    }
+    if (message.type !== 'LS_START') return undefined;
     if (busy) {
       sendResponse({ ok: false, error: '正在截图，请稍候' });
       return undefined;

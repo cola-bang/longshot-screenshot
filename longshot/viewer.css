@@ -31,9 +31,8 @@ body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
   gap: 14px;
   height: 58px;
   padding: 0 16px 0 18px;
-  background: linear-gradient(180deg, rgba(15, 19, 26, .96), rgba(11, 13, 18, .92));
+  background: linear-gradient(180deg, rgba(15, 19, 26, .97), rgba(11, 13, 18, .96));
   border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(14px);
   z-index: 20;
 }
 
@@ -120,9 +119,8 @@ button.on { background: linear-gradient(135deg, rgba(59, 130, 246, .34), rgba(34
   position: fixed; right: 20px; bottom: 96px; z-index: 35;
   width: 36px; height: 36px; border-radius: 50%;
   display: grid; place-items: center; padding: 0;
-  background: rgba(20, 25, 34, .92); border: 1px solid var(--line-strong);
+  background: rgba(20, 25, 34, .96); border: 1px solid var(--line-strong);
   color: #c8d3e4; box-shadow: 0 10px 26px rgba(0, 0, 0, .45);
-  backdrop-filter: blur(10px);
 }
 .toTop svg { width: 17px; height: 17px; }
 .toTop:hover { color: #fff; border-color: rgba(120, 175, 255, .5); }
@@ -159,10 +157,9 @@ button.on { background: linear-gradient(135deg, rgba(59, 130, 246, .34), rgba(34
   display: flex; align-items: center; gap: 8px;
   padding: 7px 9px;
   border-radius: 14px;
-  background: rgba(17, 21, 29, .94);
+  background: rgba(17, 21, 29, .97);
   border: 1px solid var(--line-strong);
   box-shadow: 0 16px 40px rgba(0, 0, 0, .55), inset 0 1px 0 rgba(255, 255, 255, .06);
-  backdrop-filter: blur(16px);
 }
 
 .seg {
@@ -194,11 +191,10 @@ button.on { background: linear-gradient(135deg, rgba(59, 130, 246, .34), rgba(34
 .loading {
   position: fixed; inset: 0; z-index: 60;
   display: grid; place-items: center;
-  background: rgba(7, 9, 13, .92);
-  backdrop-filter: blur(6px);
-  transition: opacity .3s ease;
+  background: rgba(7, 9, 13, .96);
 }
-.loading.done { opacity: 0; pointer-events: none; }
+.loading.done { display: none !important; opacity: 0; pointer-events: none; }
+.loading.done .spin { animation: none !important; }
 
 .lcard { display: flex; flex-direction: column; align-items: center; gap: 14px; min-width: 240px; }
 .lt { font-size: 13px; color: #b9c6dc; letter-spacing: .2px; }
