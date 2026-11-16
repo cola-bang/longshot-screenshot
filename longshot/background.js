@@ -200,11 +200,13 @@ async function startCapture(tabId, mode, settings) {
   try {
     const pong = await p(chrome.tabs, 'sendMessage', tabId, { type: 'LS_PING' });
     if (pong && pong.ok) {
-      if (pong.busy) throw new Error('正在截图，请稍候');
+      if (pong.busy) {
+        await p(chrome.tabs, 'sendMessage', tabId, { type: 'LS_STOP' }).catch(() => {});
+        return { ok: true, stopped: true };
+      }
       injected = true;
     }
   } catch (e) {
-    if (e && e.message === '正在截图，请稍候') throw e;
     injected = false;
   }
 
@@ -253,6 +255,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })()
       .then((res) => sendResponse(res))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
+  if (type === 'STOP_IF_CAPTURING') {
+    (async () => {
+      const tabs = await p(chrome.tabs, 'query', { active: true, currentWindow: true }).catch(() => []);
+      const tab = tabs && tabs[0];
+      if (!tab || tab.id == null) return { ok: true, stopped: false };
+      const pong = await p(chrome.tabs, 'sendMessage', tab.id, { type: 'LS_PING' }).catch(() => null);
+      if (pong && pong.ok && pong.busy) {
+        await p(chrome.tabs, 'sendMessage', tab.id, { type: 'LS_STOP' }).catch(() => {});
+        return { ok: true, stopped: true };
+      }
+      return { ok: true, stopped: false };
+    })()
+      .then((res) => sendResponse(res))
+      .catch(() => sendResponse({ ok: true, stopped: false }));
     return true;
   }
 
