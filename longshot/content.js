@@ -14,6 +14,8 @@
   const MAX_CSS_HEIGHT = 20000; // 单张成图最大高度（CSS px）
   const MAX_FRAMES = 90;
   const UI_ATTR = 'data-longshot-ui';
+  const LOCK_ATTR = 'data-longshot-lock';
+  const HIDDEN_ATTR = 'data-longshot-hidden';
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const nextFrame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
@@ -486,13 +488,27 @@
 
   /* ---------------------------------------------------------- 页面预处理 */
 
+  const HIDDEN_STYLE_CSS = `
+    [${HIDDEN_ATTR}="1"],
+    [${HIDDEN_ATTR}="1"] *,
+    [${HIDDEN_ATTR}="1"]::before,
+    [${HIDDEN_ATTR}="1"]::after {
+      visibility: hidden !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+      transition: none !important;
+      animation: none !important;
+    }
+  `;
+
   function applyPrepStyles() {
     const st = document.createElement('style');
     st.id = 'longshot-prep';
     st.textContent = `
-      html, body, * { scroll-behavior: auto !important; }
+      html, body, * { scroll-behavior: auto !important; overflow-anchor: none !important; }
       html::-webkit-scrollbar, body::-webkit-scrollbar, *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
       html, body, * { scrollbar-width: none !important; }
+      ${HIDDEN_STYLE_CSS}
     `;
     (document.head || document.documentElement).appendChild(st);
     return () => st.remove();
@@ -512,20 +528,24 @@
     };
   }
 
-  async function preloadPass(settings) {
+  async function preloadPass(settings, stopSignal) {
     const se = document.scrollingElement || document.documentElement;
     const vh = document.documentElement.clientHeight || window.innerHeight;
     const max = Math.min(se.scrollHeight, MAX_CSS_HEIGHT);
     if (max <= vh + 8) return;
     const stepSize = Math.max(220, Math.floor(vh * 0.85));
+    const delay = settings.preloadDelay == null ? 70 : settings.preloadDelay;
+    const pause = (ms) => (stopSignal ? stopSignal.wait(ms) : sleep(ms));
     let steps = 0;
     for (let y = 0; y < max && steps < 40; y += stepSize) {
+      if (stopSignal && stopSignal.aborted) return;
       window.scrollTo(0, y);
-      await sleep(settings.preloadDelay == null ? 70 : settings.preloadDelay);
+      await pause(delay);
       steps += 1;
     }
+    if (stopSignal && stopSignal.aborted) return;
     window.scrollTo(0, 0);
-    await sleep(180);
+    await pause(180);
   }
 
   function findScroller() {
@@ -549,54 +569,416 @@
     return best;
   }
 
-  const SKIP_TAGS = new Set(['HEAD', 'SCRIPT', 'STYLE', 'LINK', 'META', 'NOSCRIPT', 'TEMPLATE']);
-  const SVG_NS = 'http://www.w3.org/2000/svg';
+  /* ---------------------------------------------------------- 输入锁定 */
 
-  function hideFloating(rootEl, exclude) {
-    const vh = window.innerHeight;
-    const vw = window.innerWidth;
-    const toHide = [];
-    let visited = 0;
-    let inViewport = 0;
+  const WHEEL_TOUCH_EVENTS = [
+    'wheel', 'mousewheel', 'DOMMouseScroll',
+    'touchstart', 'touchmove', 'touchend', 'touchcancel',
+    'gesturestart', 'gesturechange', 'gestureend'
+  ];
+  const POINTER_CLICK_EVENTS = [
+    'pointerdown', 'pointerup', 'pointercancel',
+    'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu',
+    'dragstart', 'selectstart'
+  ];
+  const HOVER_MOVE_EVENTS = [
+    'pointermove', 'pointerover', 'pointerenter',
+    'mousemove', 'mouseover', 'mouseenter'
+  ];
+  const KEY_EVENTS = ['keydown', 'keypress', 'keyup'];
 
-    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_ELEMENT, {
-      acceptNode(el) {
-        if (el.hasAttribute(UI_ATTR)) return NodeFilter.FILTER_REJECT;
-        if (exclude && el === exclude) return NodeFilter.FILTER_SKIP;
-        if (SKIP_TAGS.has(el.tagName)) return NodeFilter.FILTER_REJECT;
-        if (el.namespaceURI === SVG_NS && el.localName !== 'svg') return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
+  /**
+   * 采集期间冻结用户鼠标、滚轮、触控板与键盘交互，并锁定当前滚动位置；退出时完整还原。
+   */
+  function createInputLock(onEscape) {
+    let unlocked = false;
+    let pinned = null;
+    let restoringScroll = false;
+
+    const style = document.createElement('style');
+    style.id = 'longshot-input-lock';
+    style.textContent = `
+      html, body {
+        overscroll-behavior: none !important;
+        touch-action: none !important;
+        user-select: none !important;
+        -webkit-user-select: none !important;
       }
-    });
+      body, body * {
+        pointer-events: none !important;
+      }
+      [${LOCK_ATTR}="1"], [${UI_ATTR}="1"] {
+        pointer-events: auto !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
 
-    // 第一阶段：只读收集，避免循环内读写交替引发强制同步回流
-    let el;
-    while ((el = walker.nextNode())) {
-      if (visited >= 15000 || inViewport >= 5000 || toHide.length >= 300) break;
-      visited += 1;
-      const tag = el.tagName;
-      if (tag === 'HTML' || tag === 'BODY') continue;
-      const r = el.getBoundingClientRect();
-      if (r.width < 2 || r.height < 2) continue;
-      if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
-      inViewport += 1;
-      const cs = getComputedStyle(el);
-      if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
-      if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
-      toHide.push(el);
+    const shield = document.createElement('div');
+    shield.setAttribute(LOCK_ATTR, '1');
+    shield.style.cssText =
+      'all:initial !important;position:fixed !important;inset:0 !important;top:0 !important;left:0 !important;' +
+      'width:100vw !important;height:100vh !important;z-index:2147483646 !important;background:transparent !important;' +
+      'pointer-events:auto !important;touch-action:none !important;overscroll-behavior:none !important;' +
+      'user-select:none !important;-webkit-user-select:none !important;cursor:wait !important;';
+    (document.documentElement || document.body).appendChild(shield);
+
+    const isUiEvent = (e) => {
+      if (typeof e.composedPath === 'function') {
+        for (const node of e.composedPath()) {
+          if (node && node.nodeType === 1 && typeof node.hasAttribute === 'function' && node.hasAttribute(UI_ATTR)) {
+            return true;
+          }
+        }
+      }
+      const t = e.target;
+      return Boolean(t && t.nodeType === 1 && typeof t.closest === 'function' && t.closest(`[${UI_ATTR}]`));
+    };
+
+    const blockWheelTouch = (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    };
+
+    const blockPointerOrHover = (e) => {
+      if (isUiEvent(e)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    };
+
+    const onKey = (e) => {
+      if (e.type === 'keydown' && e.key === 'Escape') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (onEscape) onEscape();
+        return;
+      }
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    };
+
+    const enforcePin = () => {
+      if (!pinned || restoringScroll) return false;
+      const { scroller, isDoc, x, y } = pinned;
+      const curX = isDoc ? Math.round(window.scrollX) : Math.round(scroller.scrollLeft);
+      const curY = getScroll(scroller, isDoc);
+      if (Math.abs(curX - x) <= 1 && Math.abs(curY - y) <= 1) return false;
+      restoringScroll = true;
+      try {
+        if (isDoc) {
+          window.scrollTo(x, y);
+        } else {
+          scroller.scrollLeft = x;
+          scroller.scrollTop = y;
+        }
+      } finally {
+        restoringScroll = false;
+      }
+      return true;
+    };
+
+    const onScrollPin = (e) => {
+      if (!pinned) return;
+      if (enforcePin()) {
+        e.stopImmediatePropagation();
+      }
+    };
+
+    const opts = { capture: true, passive: false };
+    for (const evt of WHEEL_TOUCH_EVENTS) {
+      window.addEventListener(evt, blockWheelTouch, opts);
+      shield.addEventListener(evt, blockWheelTouch, opts);
+    }
+    for (const evt of POINTER_CLICK_EVENTS) {
+      window.addEventListener(evt, blockPointerOrHover, opts);
+    }
+    for (const evt of HOVER_MOVE_EVENTS) {
+      window.addEventListener(evt, blockPointerOrHover, opts);
+    }
+    for (const evt of KEY_EVENTS) {
+      window.addEventListener(evt, onKey, opts);
+    }
+    window.addEventListener('scroll', onScrollPin, true);
+
+    return {
+      pinScroll(scroller, isDoc) {
+        if (unlocked || !scroller) return;
+        pinned = {
+          scroller,
+          isDoc,
+          x: isDoc ? Math.round(window.scrollX) : Math.round(scroller.scrollLeft),
+          y: getScroll(scroller, isDoc)
+        };
+      },
+      unpinScroll() {
+        pinned = null;
+      },
+      unlock() {
+        if (unlocked) return;
+        unlocked = true;
+        pinned = null;
+        for (const evt of WHEEL_TOUCH_EVENTS) {
+          window.removeEventListener(evt, blockWheelTouch, opts);
+          shield.removeEventListener(evt, blockWheelTouch, opts);
+        }
+        for (const evt of POINTER_CLICK_EVENTS) {
+          window.removeEventListener(evt, blockPointerOrHover, opts);
+        }
+        for (const evt of HOVER_MOVE_EVENTS) {
+          window.removeEventListener(evt, blockPointerOrHover, opts);
+        }
+        for (const evt of KEY_EVENTS) {
+          window.removeEventListener(evt, onKey, opts);
+        }
+        window.removeEventListener('scroll', onScrollPin, true);
+        shield.remove();
+        style.remove();
+      }
+    };
+  }
+
+  /* ---------------------------------------------------------- 浮层识别与隐藏 */
+
+  const SKIP_TAGS = new Set([
+    'HEAD', 'SCRIPT', 'STYLE', 'LINK', 'META', 'NOSCRIPT', 'TEMPLATE',
+    'BR', 'HR', 'WBR', 'SOURCE', 'TRACK', 'PARAM', 'COL', 'COLGROUP', 'OPTION', 'OPTGROUP'
+  ]);
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const REPLACED_TAGS = new Set(['IMG', 'SVG', 'VIDEO', 'CANVAS', 'IFRAME', 'EMBED', 'OBJECT']);
+
+  function isSkippedTag(el) {
+    if (SKIP_TAGS.has(el.tagName)) return true;
+    return el.namespaceURI === SVG_NS && el.localName !== 'svg';
+  }
+
+  function hasOwnVisualPaint(cs) {
+    const bg = cs.backgroundColor;
+    if (bg && bg !== 'transparent' && !/^rgba\([^,]+,[^,]+,[^,]+,\s*0(?:\.0+)?\)$/.test(bg)) {
+      return true;
+    }
+    if (cs.backgroundImage && cs.backgroundImage !== 'none') return true;
+    if (cs.boxShadow && cs.boxShadow !== 'none') return true;
+    if ((cs.backdropFilter && cs.backdropFilter !== 'none') || (cs.webkitBackdropFilter && cs.webkitBackdropFilter !== 'none')) {
+      return true;
+    }
+    return (
+      parseFloat(cs.borderTopWidth) > 0 ||
+      parseFloat(cs.borderRightWidth) > 0 ||
+      parseFloat(cs.borderBottomWidth) > 0 ||
+      parseFloat(cs.borderLeftWidth) > 0
+    );
+  }
+
+  function getVisualRect(el, cs) {
+    if (!cs || cs.display === 'none' || cs.opacity === '0') return null;
+    const r = el.getBoundingClientRect();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    const addBox = (box) => {
+      if (box.width < 2 || box.height < 2) return;
+      if (box.left < minX) minX = box.left;
+      if (box.top < minY) minY = box.top;
+      if (box.right > maxX) maxX = box.right;
+      if (box.bottom > maxY) maxY = box.bottom;
+    };
+
+    const ownPainted =
+      cs.visibility !== 'hidden' &&
+      r.width >= 2 &&
+      r.height >= 2 &&
+      (el.childElementCount === 0 || REPLACED_TAGS.has(el.tagName) || hasOwnVisualPaint(cs));
+    if (ownPainted) addBox(r);
+
+    // 针对 0px/1px 固定锚点容器（如 overflow:visible 下向上偏移的浮层）或透明全屏蒙层收集子元素可视区域
+    if (!ownPainted || cs.overflowX === 'visible' || cs.overflowY === 'visible') {
+      const queue = [];
+      for (let i = 0; i < el.children.length; i += 1) queue.push(el.children[i]);
+      if (el.shadowRoot) {
+        for (let i = 0; i < el.shadowRoot.children.length; i += 1) queue.push(el.shadowRoot.children[i]);
+      }
+      let head = 0;
+      let checked = 0;
+      while (head < queue.length && checked < 80) {
+        const child = queue[head++];
+        if (!child || child.nodeType !== 1 || isSkippedTag(child)) continue;
+        checked += 1;
+        const ccs = getComputedStyle(child);
+        if (ccs.display === 'none' || ccs.opacity === '0') continue;
+        const cr = child.getBoundingClientRect();
+        if (
+          ccs.visibility !== 'hidden' &&
+          cr.width >= 2 &&
+          cr.height >= 2 &&
+          (child.childElementCount === 0 || REPLACED_TAGS.has(child.tagName) || hasOwnVisualPaint(ccs))
+        ) {
+          addBox(cr);
+        }
+        for (let i = 0; i < child.children.length; i += 1) queue.push(child.children[i]);
+        if (child.shadowRoot) {
+          for (let i = 0; i < child.shadowRoot.children.length; i += 1) queue.push(child.shadowRoot.children[i]);
+        }
+      }
     }
 
-    // 第二阶段：批量写入样式
-    const saved = [];
-    for (const node of toHide) {
-      saved.push([node, node.style.getPropertyValue('visibility'), node.style.getPropertyPriority('visibility')]);
-      node.style.setProperty('visibility', 'hidden', 'important');
+    if (minX === Infinity && cs.visibility !== 'hidden' && r.width >= 2 && r.height >= 2) {
+      addBox(r);
     }
+    if (minX === Infinity) return null;
+    return {
+      left: minX,
+      top: minY,
+      right: maxX,
+      bottom: maxY,
+      width: maxX - minX,
+      height: maxY - minY
+    };
+  }
 
-    return () => {
-      for (const [node, v, prio] of saved) {
-        if (v) node.style.setProperty('visibility', v, prio);
-        else node.style.removeProperty('visibility');
+  /**
+   * 逐帧浮层隐藏器：按广度优先扫描固定/粘性定位、1px 锚点溢出浮层、JS 滚动吸顶及 Shadow DOM 浮层。
+   */
+  function createFloatingHider(rootEl, excludeScroller, isDoc) {
+    const hiddenNodes = new Set();
+    const shadowStyles = new Map();
+    const jsStickyProbes = new WeakMap();
+
+    const ensureShadowStyle = (rootNode) => {
+      if (!rootNode || !(rootNode instanceof ShadowRoot) || shadowStyles.has(rootNode)) return;
+      const st = document.createElement('style');
+      st.textContent = HIDDEN_STYLE_CSS;
+      rootNode.appendChild(st);
+      shadowStyles.set(rootNode, st);
+    };
+
+    const isBottomBand = (vr, vw, vh) =>
+      vr.top >= vh * 0.28 && vr.height <= vh * 0.75 && vr.width * vr.height <= vw * vh * 0.5;
+
+    const markHidden = (node) => {
+      if (hiddenNodes.has(node)) return 0;
+      node.setAttribute(HIDDEN_ATTR, '1');
+      const rootNode = typeof node.getRootNode === 'function' ? node.getRootNode() : null;
+      if (rootNode instanceof ShadowRoot) ensureShadowStyle(rootNode);
+      hiddenNodes.add(node);
+      return 1;
+    };
+
+    const enqueueChildren = (queue, el) => {
+      const ch = el.children;
+      for (let i = 0; i < ch.length; i += 1) queue.push(ch[i]);
+      if (el.shadowRoot) {
+        const sr = el.shadowRoot.children;
+        for (let i = 0; i < sr.length; i += 1) queue.push(sr[i]);
+      }
+    };
+
+    return {
+      scan({ isFirstFrame = false, allowBottomFixedHide = false, scrollPos = 0 } = {}) {
+        const vh = window.innerHeight;
+        const vw = window.innerWidth;
+        const queue = [rootEl];
+        let head = 0;
+        let visited = 0;
+        let newlyHidden = 0;
+
+        while (head < queue.length && visited < 60000) {
+          const el = queue[head++];
+          if (!el || el.nodeType !== 1) continue;
+          if (el.hasAttribute(UI_ATTR) || el.hasAttribute(LOCK_ATTR) || el.hasAttribute(HIDDEN_ATTR)) continue;
+          if (isSkippedTag(el)) continue;
+
+          visited += 1;
+          const tag = el.tagName;
+          if (tag === 'HTML' || tag === 'BODY') {
+            enqueueChildren(queue, el);
+            continue;
+          }
+
+          const isProtectedAncestor = Boolean(excludeScroller && (el === excludeScroller || el.contains(excludeScroller)));
+          const cs = getComputedStyle(el);
+          if (cs.display === 'none') continue;
+
+          const pos = cs.position;
+          if (pos === 'fixed' || pos === 'sticky') {
+            if (!isProtectedAncestor) {
+              const vr = getVisualRect(el, cs);
+              if (vr && vr.bottom > 0 && vr.top < vh && vr.right > 0 && vr.left < vw) {
+                let isFullPageShell = false;
+                if (vr.width >= vw * 0.9 && vr.height >= vh * 0.9) {
+                  const zi = parseInt(cs.zIndex, 10);
+                  if (!Number.isNaN(zi) && zi < 0) isFullPageShell = true;
+                  else if (pos === 'sticky' && el.scrollHeight > vh * 1.4) isFullPageShell = true;
+                  else if (isDoc && el.querySelectorAll('p, article, section, h1, h2, h3').length > 40) isFullPageShell = true;
+                }
+
+                if (!isFullPageShell) {
+                  if (isFirstFrame) {
+                    if (allowBottomFixedHide && pos === 'fixed') {
+                      if (isBottomBand(vr, vw, vh)) {
+                        newlyHidden += markHidden(el);
+                        continue;
+                      }
+                      if (vr.top < vh * 0.28 && vr.bottom > vh * 0.55 && !hasOwnVisualPaint(cs)) {
+                        for (let i = 0; i < el.children.length; i += 1) {
+                          const child = el.children[i];
+                          if (child.hasAttribute(UI_ATTR) || child.hasAttribute(LOCK_ATTR) || child.hasAttribute(HIDDEN_ATTR)) continue;
+                          const ccs = getComputedStyle(child);
+                          const cvr = getVisualRect(child, ccs);
+                          if (cvr && cvr.bottom > 0 && cvr.top < vh && cvr.right > 0 && cvr.left < vw && isBottomBand(cvr, vw, vh)) {
+                            newlyHidden += markHidden(child);
+                          }
+                        }
+                      }
+                    }
+                  } else {
+                    newlyHidden += markHidden(el);
+                    continue;
+                  }
+                }
+              }
+            }
+          } else if (
+            isDoc &&
+            !isProtectedAncestor &&
+            (pos === 'absolute' || (pos === 'relative' && cs.transform !== 'none')) &&
+            cs.zIndex !== 'auto' &&
+            cs.visibility !== 'hidden' &&
+            cs.opacity !== '0'
+          ) {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 36 && r.height >= 16 && r.height <= vh * 0.38 && r.bottom > 0 && r.top < vh) {
+              const prev = jsStickyProbes.get(el);
+              if (
+                !isFirstFrame &&
+                prev &&
+                Math.abs(scrollPos - prev.scrollPos) >= 100 &&
+                Math.abs(r.top - prev.top) <= 2 &&
+                Math.abs(r.left - prev.left) <= 2 &&
+                Math.abs(r.height - prev.height) <= 2
+              ) {
+                newlyHidden += markHidden(el);
+                continue;
+              }
+              if (!prev) {
+                jsStickyProbes.set(el, { top: r.top, left: r.left, height: r.height, scrollPos });
+              }
+            }
+          }
+
+          enqueueChildren(queue, el);
+        }
+
+        return newlyHidden;
+      },
+      restore() {
+        for (const node of hiddenNodes) {
+          node.removeAttribute(HIDDEN_ATTR);
+        }
+        hiddenNodes.clear();
+        for (const st of shadowStyles.values()) {
+          st.remove();
+        }
+        shadowStyles.clear();
       }
     };
   }
@@ -621,9 +1003,11 @@
     return Math.round(isDoc ? window.scrollY : scroller.scrollTop);
   }
 
-  async function settle(settings) {
+  async function settle(settings, stopSignal) {
     await nextFrame();
-    await sleep(settings.settle == null ? 130 : settings.settle);
+    const ms = settings.settle == null ? 130 : settings.settle;
+    if (stopSignal) await stopSignal.wait(ms);
+    else await sleep(ms);
   }
 
   async function captureAndStoreFrame(id, index, dy, src) {
@@ -673,6 +1057,36 @@
     };
   }
 
+  async function prepareFrame({ scroller, isDoc, y, lock, hider, isFirstFrame, allowBottomFixedHide, settleMs, stopSignal, isCancelled }) {
+    lock.unpinScroll();
+    setScroll(scroller, isDoc, y);
+    lock.pinScroll(scroller, isDoc);
+    await nextFrame();
+    if (isCancelled()) throw new Error('已取消截图');
+    if (stopSignal.aborted) return null;
+    if (hider) {
+      hider.scan({
+        isFirstFrame,
+        allowBottomFixedHide,
+        scrollPos: getScroll(scroller, isDoc)
+      });
+    }
+    await stopSignal.wait(settleMs);
+    if (isCancelled()) throw new Error('已取消截图');
+    if (stopSignal.aborted) return null;
+    if (hider) {
+      const added = hider.scan({
+        isFirstFrame,
+        allowBottomFixedHide,
+        scrollPos: getScroll(scroller, isDoc)
+      });
+      if (added > 0) await nextFrame();
+    }
+    const actual = getScroll(scroller, isDoc);
+    lock.pinScroll(scroller, isDoc);
+    return actual;
+  }
+
   /**
    * 滚动采集
    * @param {string} id  采集会话 id
@@ -681,8 +1095,9 @@
    * @param {boolean} isDoc 是否文档级滚动
    * @param {{x,y,w,h}} crop 每帧从视口裁切的矩形（CSS px）
    * @param {boolean} hideFromStart 是否第一帧就隐藏浮层
+   * @param {object} [sharedCtx] 可选共享中止信号与输入锁
    */
-  async function runScrollCapture(id, settings, scroller, isDoc, crop, hideFromStart) {
+  async function runScrollCapture(id, settings, scroller, isDoc, crop, hideFromStart, sharedCtx) {
     const vp = docViewport();
     const step = Math.max(80, Math.round(crop.h));
     const limit = Math.min(scroller.scrollHeight, MAX_CSS_HEIGHT);
@@ -690,41 +1105,48 @@
     for (let y = 0; y < limit; y += step) ys.push(Math.min(y, Math.max(0, limit - step)));
     if (!ys.length) ys.push(0);
 
-    let unhide = null;
+    const ownsLock = !(sharedCtx && sharedCtx.lock);
+    let localCancelled = false;
+    const stopSignal = (sharedCtx && sharedCtx.stopSignal) || createAbortSignal();
+    const isCancelled = (sharedCtx && sharedCtx.isCancelled) || (() => localCancelled);
+    const lock = ownsLock
+      ? createInputLock(() => {
+          localCancelled = true;
+          stopSignal.abort();
+        })
+      : sharedCtx.lock;
+    if (ownsLock) activeStopSignal = stopSignal;
+
+    const hider = settings.hideSticky !== false ? createFloatingHider(document.documentElement, isDoc ? null : scroller, isDoc) : null;
+    const isMultiFrame = ys.length > 1 || limit > crop.h + 8;
+    const settleMs = settings.settle == null ? 130 : settings.settle;
+
     let index = 0;
     let total = limit;
     let baseOffset = null;
     let outH = 0;
-    let cancelled = false;
-    const stopSignal = createAbortSignal();
-
-    const onKey = (e) => {
-      if (e.key === 'Escape') {
-        cancelled = true;
-        stopSignal.abort();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    activeStopSignal = stopSignal;
 
     ui.setHidden(true);
     try {
-      if (hideFromStart && settings.hideSticky !== false) {
-        unhide = hideFloating(document.documentElement, isDoc ? null : scroller);
-      }
-
       while (index < ys.length) {
-        if (cancelled) throw new Error('已取消截图');
+        if (isCancelled()) throw new Error('已取消截图');
         if (stopSignal.aborted) break;
         if (index >= MAX_FRAMES) break;
 
-        setScroll(scroller, isDoc, ys[index]);
-        await nextFrame();
-        await stopSignal.wait(settings.settle == null ? 130 : settings.settle);
-        if (cancelled) throw new Error('已取消截图');
-        if (stopSignal.aborted) break;
+        const actual = await prepareFrame({
+          scroller,
+          isDoc,
+          y: ys[index],
+          lock,
+          hider,
+          isFirstFrame: index === 0 && !hideFromStart,
+          allowBottomFixedHide: isMultiFrame,
+          settleMs,
+          stopSignal,
+          isCancelled
+        });
+        if (actual == null) break;
 
-        const actual = getScroll(scroller, isDoc);
         if (baseOffset == null) baseOffset = actual;
         const dy = Math.max(0, actual - baseOffset);
 
@@ -744,21 +1166,20 @@
           }
           total = now;
         }
-
-        if (index === 1 && !hideFromStart && settings.hideSticky !== false) {
-          unhide = hideFloating(document.documentElement, isDoc ? null : scroller);
-        }
       }
 
       if (stopSignal.aborted && index === 0) {
         throw new Error('已取消截图');
       }
     } finally {
-      window.removeEventListener('keydown', onKey, true);
-      activeStopSignal = null;
-      if (unhide) unhide();
+      lock.unpinScroll();
+      if (hider) hider.restore();
       ui.setHidden(false);
       ui.hide();
+      if (ownsLock) {
+        activeStopSignal = null;
+        lock.unlock();
+      }
     }
 
     return { pages: index, outW: crop.w, outH: Math.round(Math.min(outH, total)), frameW: vp.iw };
@@ -786,9 +1207,19 @@
     ui.show('正在准备页面', settings.preload === false ? '即将开始逐帧截取' : '预加载页面内容…');
     const restoreStyle = applyPrepStyles();
     const restoreEager = preferEagerImages();
+    let cancelled = false;
+    const stopSignal = createAbortSignal();
+    const lock = createInputLock(() => {
+      cancelled = true;
+      stopSignal.abort();
+    });
+    const sharedCtx = { stopSignal, isCancelled: () => cancelled, lock };
+    activeStopSignal = stopSignal;
+
     try {
       if (settings.preload !== false) {
-        await preloadPass(settings);
+        await preloadPass(settings, stopSignal);
+        if (cancelled || stopSignal.aborted) throw new Error('已取消截图');
         ui.update('页面已就绪', '正在逐帧截取');
       }
 
@@ -798,23 +1229,27 @@
         if (inner) {
           ui.update('检测到内层滚动容器', '正在截取该区域');
           inner.scrollIntoView({ block: 'center', inline: 'nearest' });
-          await settle(settings);
+          await settle(settings, stopSignal);
+          if (cancelled || stopSignal.aborted) throw new Error('已取消截图');
           const rect = elementClientRect(inner);
           if (rect.h > docViewport().h - 4) throw new Error('页面使用了内层滚动容器，且容器高于可视区域，请缩小页面缩放后重试。');
-          const res = await runScrollCapture(id, settings, inner, false, rect, false);
-          return res;
+          return await runScrollCapture(id, settings, inner, false, rect, false, sharedCtx);
         }
       }
 
       window.scrollTo(0, 0);
-      await settle(settings);
+      await settle(settings, stopSignal);
+      if (cancelled || stopSignal.aborted) throw new Error('已取消截图');
       const vp = docViewport();
-      const res = await runScrollCapture(id, settings, se, true, { x: 0, y: 0, w: vp.w, h: vp.h }, false);
+      const res = await runScrollCapture(id, settings, se, true, { x: 0, y: 0, w: vp.w, h: vp.h }, false, sharedCtx);
       if (res.outH >= MAX_CSS_HEIGHT - 2) {
         ui.toast('页面超过 20000px，已截取前 20000px', false, 3600);
       }
       return res;
     } finally {
+      lock.unpinScroll();
+      activeStopSignal = null;
+      lock.unlock();
       restoreEager();
       restoreStyle();
       if (saved) window.scrollTo(saved.x, saved.y);
@@ -824,9 +1259,19 @@
   async function captureElementArea(id, settings, el, saved) {
     const restoreStyle = applyPrepStyles();
     const restoreEager = preferEagerImages();
+    let cancelled = false;
+    const stopSignal = createAbortSignal();
+    const lock = createInputLock(() => {
+      cancelled = true;
+      stopSignal.abort();
+    });
+    const sharedCtx = { stopSignal, isCancelled: () => cancelled, lock };
+    activeStopSignal = stopSignal;
+
     try {
       el.scrollIntoView({ block: 'center', inline: 'nearest' });
-      await settle(settings);
+      await settle(settings, stopSignal);
+      if (cancelled || stopSignal.aborted) throw new Error('已取消截图');
       const rect = elementClientRect(el);
       const vp = docViewport();
       if (rect.h > vp.h - 4) throw new Error('该元素高于可视区域，请先按 Ctrl + 减号 缩小页面，再试一次。');
@@ -834,19 +1279,21 @@
       const scrollable = el.scrollHeight > el.clientHeight + 8;
       if (!scrollable) {
         ui.show('正在截取元素', '该元素不可滚动，截取当前可视部分');
-        const res = await captureSingleFrame(id, settings, rect);
-        return res;
+        return await captureSingleFrame(id, settings, rect, sharedCtx);
       }
       ui.show('正在截取元素', '逐帧滚动容器内容');
-      return await runScrollCapture(id, settings, el, false, rect, true);
+      return await runScrollCapture(id, settings, el, false, rect, true, sharedCtx);
     } finally {
+      lock.unpinScroll();
+      activeStopSignal = null;
+      lock.unlock();
       restoreEager();
       restoreStyle();
       if (saved) window.scrollTo(saved.x, saved.y);
     }
   }
 
-  async function captureSingleFrame(id, settings, crop) {
+  async function captureSingleFrame(id, settings, crop, sharedCtx) {
     const vp = docViewport();
     // 裁掉右侧滚动条区域
     const x = Math.max(0, Math.min(crop.x, vp.w - 1));
@@ -854,15 +1301,35 @@
     const w = Math.max(1, Math.min(crop.w, vp.w - x));
     const h = Math.max(1, Math.min(crop.h, vp.h - y));
     const rect = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+    const ownsLock = !(sharedCtx && sharedCtx.lock);
+    let localCancelled = false;
+    const stopSignal = (sharedCtx && sharedCtx.stopSignal) || createAbortSignal();
+    const isCancelled = (sharedCtx && sharedCtx.isCancelled) || (() => localCancelled);
+    const lock = ownsLock
+      ? createInputLock(() => {
+          localCancelled = true;
+          stopSignal.abort();
+        })
+      : sharedCtx.lock;
+    const se = document.scrollingElement || document.documentElement;
+    if (ownsLock) activeStopSignal = stopSignal;
+
     ui.setHidden(true);
     try {
-      await settle(settings);
+      if (se) lock.pinScroll(se, true);
+      await settle(settings, stopSignal);
+      if (isCancelled() || stopSignal.aborted) throw new Error('已取消截图');
       notify('1/1');
       await captureAndStoreFrame(id, 0, 0, rect);
       return { pages: 1, outW: rect.w, outH: rect.h, frameW: vp.iw };
     } finally {
+      lock.unpinScroll();
       ui.setHidden(false);
       ui.hide();
+      if (ownsLock) {
+        activeStopSignal = null;
+        lock.unlock();
+      }
     }
   }
 
@@ -884,29 +1351,32 @@
     const limit = Math.min(scrollH, MAX_CSS_HEIGHT);
     const height = Math.max(4, Math.min(sel.h, limit - top));
 
-    let unhide = null;
+    let hider = null;
     let cancelled = false;
     const stopSignal = createAbortSignal();
-    const onKey = (e) => {
-      if (e.key === 'Escape') {
-        cancelled = true;
-        stopSignal.abort();
-      }
-    };
+    const lock = createInputLock(() => {
+      cancelled = true;
+      stopSignal.abort();
+    });
 
     ui.show('正在截取选区', `${Math.round(w)} × ${Math.round(height)}`);
     ui.setHidden(true);
-    window.addEventListener('keydown', onKey, true);
     activeStopSignal = stopSignal;
     try {
-      if (height > vh * 1.3 && settings.preload !== false) await preloadPass(settings);
+      if (height > vh * 1.3 && settings.preload !== false) {
+        await preloadPass(settings, stopSignal);
+        if (cancelled || stopSignal.aborted) throw new Error('已取消截图');
+      }
       vp = docViewport();
       vh = vp.h;
       scrollH = se.scrollHeight;
-      if (settings.hideSticky !== false) unhide = hideFloating(document.documentElement, null);
+      if (settings.hideSticky !== false) {
+        hider = createFloatingHider(document.documentElement, null, true);
+      }
 
       const maxScroll = Math.max(0, scrollH - vh);
       const end = top + height;
+      const settleMs = settings.settle == null ? 130 : settings.settle;
       let scroll = Math.min(top, maxScroll);
       let index = 0;
       let capturedH = 0;
@@ -914,13 +1384,21 @@
       for (let guard = 0; guard < MAX_FRAMES; guard += 1) {
         if (cancelled) throw new Error('已取消截图');
         if (stopSignal.aborted) break;
-        setScroll(se, true, scroll);
-        await nextFrame();
-        await stopSignal.wait(settings.settle == null ? 130 : settings.settle);
-        if (cancelled) throw new Error('已取消截图');
-        if (stopSignal.aborted) break;
 
-        const actual = Math.round(window.scrollY);
+        const actual = await prepareFrame({
+          scroller: se,
+          isDoc: true,
+          y: scroll,
+          lock,
+          hider,
+          isFirstFrame: index === 0 && top < 40,
+          allowBottomFixedHide: height > vh * 0.5 || top >= 40,
+          settleMs,
+          stopSignal,
+          isCancelled: () => cancelled
+        });
+        if (actual == null) break;
+
         const sTop = Math.max(actual, top);
         const sBottom = Math.min(actual + vh, end);
         if (sBottom - sTop < 2) break;
@@ -947,9 +1425,10 @@
       const outH = stopSignal.aborted ? capturedH : Math.round(height);
       return { pages: index, outW: Math.round(w), outH, frameW: vp.iw };
     } finally {
-      window.removeEventListener('keydown', onKey, true);
+      lock.unpinScroll();
       activeStopSignal = null;
-      if (unhide) unhide();
+      if (hider) hider.restore();
+      lock.unlock();
       ui.setHidden(false);
       ui.hide();
       restoreEager();

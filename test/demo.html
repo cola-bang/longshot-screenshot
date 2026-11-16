@@ -35,6 +35,26 @@
   section h2 { margin: 0 0 6px; font-size: 19px; }
   section p { margin: 0; color: #4a566d; font-size: 13.5px; }
 
+  .card:hover { outline: 4px solid #00ff00; }
+
+  .dyn-channel {
+    display: none; position: fixed; top: 64px; left: 0; right: 0; height: 48px; z-index: 60;
+    align-items: center; padding: 0 24px; background: #ff00aa; color: #fff; font-size: 13px;
+  }
+  .dyn-channel.active { display: flex; }
+
+  .lt-row {
+    position: fixed; bottom: 0; left: 0; width: 100%; height: 1px; z-index: 90;
+    display: flex; justify-content: flex-end; pointer-events: none;
+  }
+  .lt-row .lt-col { position: relative; height: 1px; }
+  .login-tip {
+    position: relative; top: -180px; margin-right: 90px; width: 240px; height: 110px;
+    border-radius: 10px; background: #00aeec; color: #fff;
+    display: flex; align-items: center; justify-content: center; font-weight: 600;
+    pointer-events: auto;
+  }
+
   .thumb { width: 120px; height: 76px; border-radius: 10px; background: #e9eef8; display: block; }
 
   .chat {
@@ -57,6 +77,7 @@
 </head>
 <body>
   <div class="nav"><b>PAGE</b><span>LongShot 测试页</span><span class="right">吸顶导航栏</span></div>
+  <div class="dyn-channel" id="dynChannelBar">动态吸顶频道栏（滚动后出现）</div>
 
   <div class="hero">
     <h1>整页长截图验证页面</h1>
@@ -73,6 +94,11 @@
   <footer>—— 页面结束 ——</footer>
 
   <div class="chat">客服</div>
+  <div class="lt-row" id="biliLoginRow">
+    <div class="lt-col">
+      <div class="login-tip" id="biliLoginTip">立即登录 · 测试浮层</div>
+    </div>
+  </div>
 
 <script>
   const PALETTE = [
@@ -135,6 +161,18 @@
     row.textContent = `滚动容器第 ${i + 1} 行`;
     sc.appendChild(row);
   }
+
+  const dynBar = document.getElementById('dynChannelBar');
+  window.addEventListener('scroll', () => {
+    dynBar.classList.toggle('active', window.scrollY > 56);
+  }, { passive: true });
+
+  window.__inputLeakCount = 0;
+  ['wheel', 'mousedown', 'click', 'mousemove', 'mouseenter', 'keydown'].forEach((evt) => {
+    document.body.addEventListener(evt, () => {
+      window.__inputLeakCount += 1;
+    });
+  });
 </script>
 </body>
 </html>
