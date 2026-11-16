@@ -19,6 +19,7 @@
   const nextFrame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 
   let busy = false;
+  let activeStopSignal = null;
 
   /* ---------------------------------------------------------------- 通信 */
 
@@ -632,6 +633,36 @@
     await msg({ type: 'CAPTURE_FRAME', id, index, dy, src });
   }
 
+  function createAbortSignal() {
+    let aborted = false;
+    let resolvers = [];
+    return {
+      get aborted() {
+        return aborted;
+      },
+      abort() {
+        if (aborted) return;
+        aborted = true;
+        const list = resolvers;
+        resolvers = [];
+        for (const r of list) r();
+      },
+      wait(ms) {
+        if (aborted || ms <= 0) return Promise.resolve();
+        return new Promise((resolve) => {
+          let timer = 0;
+          const done = () => {
+            clearTimeout(timer);
+            resolvers = resolvers.filter((fn) => fn !== done);
+            resolve();
+          };
+          resolvers.push(done);
+          timer = setTimeout(done, ms);
+        });
+      }
+    };
+  }
+
   function elementClientRect(el) {
     const r = el.getBoundingClientRect();
     return {
@@ -665,11 +696,16 @@
     let baseOffset = null;
     let outH = 0;
     let cancelled = false;
+    const stopSignal = createAbortSignal();
 
     const onKey = (e) => {
-      if (e.key === 'Escape') cancelled = true;
+      if (e.key === 'Escape') {
+        cancelled = true;
+        stopSignal.abort();
+      }
     };
     window.addEventListener('keydown', onKey, true);
+    activeStopSignal = stopSignal;
 
     ui.setHidden(true);
     try {
@@ -679,17 +715,20 @@
 
       while (index < ys.length) {
         if (cancelled) throw new Error('已取消截图');
+        if (stopSignal.aborted) break;
         if (index >= MAX_FRAMES) break;
 
         setScroll(scroller, isDoc, ys[index]);
-        await settle(settings);
+        await nextFrame();
+        await stopSignal.wait(settings.settle == null ? 130 : settings.settle);
+        if (cancelled) throw new Error('已取消截图');
+        if (stopSignal.aborted) break;
 
         const actual = getScroll(scroller, isDoc);
         if (baseOffset == null) baseOffset = actual;
         const dy = Math.max(0, actual - baseOffset);
 
         notify(`${Math.min(index + 1, ys.length)}/${ys.length}`);
-        ui.update(`正在截取 ${index + 1}/${ys.length}`, '请勿切换标签页', (index + 1) / ys.length);
 
         await captureAndStoreFrame(id, index, dy, { x: crop.x, y: crop.y, w: crop.w, h: crop.h });
 
@@ -710,8 +749,13 @@
           unhide = hideFloating(document.documentElement, isDoc ? null : scroller);
         }
       }
+
+      if (stopSignal.aborted && index === 0) {
+        throw new Error('已取消截图');
+      }
     } finally {
       window.removeEventListener('keydown', onKey, true);
+      activeStopSignal = null;
       if (unhide) unhide();
       ui.setHidden(false);
       ui.hide();
@@ -842,13 +886,18 @@
 
     let unhide = null;
     let cancelled = false;
+    const stopSignal = createAbortSignal();
     const onKey = (e) => {
-      if (e.key === 'Escape') cancelled = true;
+      if (e.key === 'Escape') {
+        cancelled = true;
+        stopSignal.abort();
+      }
     };
 
     ui.show('正在截取选区', `${Math.round(w)} × ${Math.round(height)}`);
     ui.setHidden(true);
     window.addEventListener('keydown', onKey, true);
+    activeStopSignal = stopSignal;
     try {
       if (height > vh * 1.3 && settings.preload !== false) await preloadPass(settings);
       vp = docViewport();
@@ -860,11 +909,16 @@
       const end = top + height;
       let scroll = Math.min(top, maxScroll);
       let index = 0;
+      let capturedH = 0;
 
       for (let guard = 0; guard < MAX_FRAMES; guard += 1) {
         if (cancelled) throw new Error('已取消截图');
+        if (stopSignal.aborted) break;
         setScroll(se, true, scroll);
-        await settle(settings);
+        await nextFrame();
+        await stopSignal.wait(settings.settle == null ? 130 : settings.settle);
+        if (cancelled) throw new Error('已取消截图');
+        if (stopSignal.aborted) break;
 
         const actual = Math.round(window.scrollY);
         const sTop = Math.max(actual, top);
@@ -879,6 +933,7 @@
         };
         notify(`截取中 ${index + 1}`);
         await captureAndStoreFrame(id, index, Math.round(sTop - top), src);
+        capturedH = Math.max(capturedH, Math.round(sBottom - top));
         index += 1;
 
         if (sBottom >= end) break;
@@ -887,10 +942,13 @@
         scroll = next;
       }
 
+      if (stopSignal.aborted && index === 0) throw new Error('已取消截图');
       if (!index) throw new Error('选区没有取到画面');
-      return { pages: index, outW: Math.round(w), outH: Math.round(height), frameW: vp.iw };
+      const outH = stopSignal.aborted ? capturedH : Math.round(height);
+      return { pages: index, outW: Math.round(w), outH, frameW: vp.iw };
     } finally {
       window.removeEventListener('keydown', onKey, true);
+      activeStopSignal = null;
       if (unhide) unhide();
       ui.setHidden(false);
       ui.hide();
@@ -965,6 +1023,11 @@
     if (!message) return undefined;
     if (message.type === 'LS_PING') {
       sendResponse({ ok: true, busy });
+      return undefined;
+    }
+    if (message.type === 'LS_STOP') {
+      if (activeStopSignal) activeStopSignal.abort();
+      sendResponse({ ok: true });
       return undefined;
     }
     if (message.type !== 'LS_START') return undefined;

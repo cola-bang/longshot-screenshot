@@ -113,9 +113,31 @@ const tabId = await sw.evaluate(async (urlPrefix) => {
 if (tabId == null) throw new Error('找不到目标 tabId');
 log('目标 tabId =', tabId);
 
+function waitForViewer(timeout = 150000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      context.off('page', onPage);
+      reject(new Error('等待 viewer.html 超时'));
+    }, timeout);
+    const onPage = async (p) => {
+      try {
+        await p.waitForLoadState('domcontentloaded');
+        if (p.url().includes('viewer.html')) {
+          clearTimeout(timer);
+          context.off('page', onPage);
+          resolve(p);
+        }
+      } catch (_) {
+        /* ignore closed stopper window */
+      }
+    };
+    context.on('page', onPage);
+  });
+}
+
 async function trigger(mode, settings = {}) {
   await page.bringToFront();
-  const viewerPromise = context.waitForEvent('page', { timeout: 150000 });
+  const viewerPromise = waitForViewer(150000);
   const startPromise = sw
     .evaluate(
       async ({ tabId, mode, settings }) => {
@@ -333,7 +355,7 @@ const box = await page.evaluate(() => {
   const r = el.getBoundingClientRect();
   return { x: r.left + 4, y: r.top + r.height / 2, w: r.width, h: r.height };
 });
-const v2p = context.waitForEvent('page', { timeout: 150000 });
+const v2p = waitForViewer(150000);
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -361,7 +383,7 @@ await v2.close();
 /* ------------------------------ 3. 区域 ---------------------------------- */
 log('— 区域截图 —');
 await page.bringToFront();
-const v3p = context.waitForEvent('page', { timeout: 120000 });
+const v3p = waitForViewer(120000);
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -391,7 +413,7 @@ log('— 可视区域 —');
 await page.bringToFront();
 await page.evaluate(() => window.scrollTo(0, 1400));
 await page.waitForTimeout(250);
-const v4p = context.waitForEvent('page', { timeout: 120000 });
+const v4p = waitForViewer(120000);
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -417,7 +439,7 @@ log('— 框选长图（拖到边缘自动滚动）—');
 await page.bringToFront();
 await page.evaluate(() => window.scrollTo(0, 400));
 await page.waitForTimeout(300);
-const v5p = context.waitForEvent('page', { timeout: 120000 });
+const v5p = waitForViewer(120000);
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -447,6 +469,73 @@ if (r5.outH <= 900) fail(`选区没有延伸出屏幕: 高度仅 ${r5.outH}`);
 if (Math.abs(r5.outW - 440) > 6) fail(`选区宽度异常: ${r5.outW}`);
 await saveBase(v5, 'region-long.png');
 await v5.close();
+await page.evaluate(() => window.scrollTo(0, 0));
+
+/* ------------------------- 3.7 提前停止并保存 ------------------------- */
+log('— 再次触发/快捷键提前停止并保存 —');
+await page.bringToFront();
+const v6p = waitForViewer(120000);
+await sw.evaluate(
+  async ({ tabId }) => {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode: 'full', settings: { preload: false } });
+  },
+  { tabId }
+);
+
+let progress = '';
+const deadline = Date.now() + 20000;
+while (Date.now() < deadline) {
+  const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));
+  if (/^[2-9]\d*\//.test(badge || '')) {
+    progress = badge;
+    break;
+  }
+  await page.waitForTimeout(150);
+}
+if (!progress) throw new Error('等待截图进度到达第 2 帧超时');
+
+const uiHiddenDuringCapture = await page.evaluate(() => {
+  const host = document.querySelector('[data-longshot-ui="1"]');
+  return !host || host.style.display === 'none';
+});
+if (!uiHiddenDuringCapture) fail('采集期间页面内浮层未保持隐藏（可能闪烁或被截入）');
+else log(`采集期间页面浮层全程隐藏校验通过 (progress="${progress}")`);
+
+// 模拟再次点击扩展图标 / 按快捷键触发停止并保存
+const stopRes = await sw.evaluate(async ({ tabId }) => {
+  return await startCapture(tabId, 'full', {});
+}, { tabId });
+if (!stopRes || !stopRes.stopped) fail(`再次触发未返回 stopped: ${JSON.stringify(stopRes)}`);
+else log('再次触发立即停止并保存校验通过');
+
+const v6 = await v6p;
+await v6.waitForLoadState('domcontentloaded');
+await v6.waitForFunction(() => window.__longshot && window.__longshot.base, null, { timeout: 60000 });
+
+const r6 = await v6.evaluate((expected) => {
+  const s = window.__longshot;
+  const ctx = s.base.getContext('2d');
+  const k = s.baseW / s.meta.outW;
+  // 校验前两帧右下角（停止按钮所在区域 x=920, y=760/1560）没有出现红色按钮像素
+  const samples = [];
+  for (let frame = 0; frame < s.meta.pages; frame += 1) {
+    const cssY = frame * 800 + 762;
+    if (cssY >= s.meta.outH) continue;
+    const sec = expected.find((it) => cssY >= it.top && cssY < it.top + it.height);
+    const d = ctx.getImageData(Math.round(920 * k), Math.round(cssY * k), 1, 1).data;
+    const isRedBtn = d[0] > 200 && d[1] < 90 && d[2] < 90;
+    samples.push({ frame, cssY, rgb: [d[0], d[1], d[2]], isRedBtn, secColor: sec && sec.color });
+  }
+  return { pages: s.meta.pages, outW: s.meta.outW, outH: s.meta.outH, samples };
+}, info.sections);
+log(`提前停止输出 CSS ${r6.outW}×${r6.outH}, 帧数 ${r6.pages}/13`);
+if (r6.pages < 1 || r6.pages >= 13) fail(`提前停止帧数异常: ${r6.pages}`);
+const leaked = r6.samples.filter((s) => s.isRedBtn);
+if (leaked.length) fail(`停止按钮被截入了图片: ${JSON.stringify(leaked)}`);
+else log(`停止按钮未截入图片校验通过 (${r6.samples.length} 帧右下角均干净)`);
+await saveBase(v6, 'stop-early.png');
+await v6.close();
 await page.evaluate(() => window.scrollTo(0, 0));
 
 /* ------------------------------ 4. popup --------------------------------- */

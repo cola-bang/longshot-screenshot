@@ -218,6 +218,16 @@ async function hydrateActiveTab() {
 }
 
 function hydrateAfterPaint() {
+  // 若当前标签页正在截图中，再次点击扩展图标直接停止并保存已截内容
+  try {
+    chrome.runtime.sendMessage({ type: 'STOP_IF_CAPTURING' }, (res) => {
+      if (!chrome.runtime.lastError && res && res.stopped) {
+        window.close();
+      }
+    });
+  } catch (e) {
+    /* ignore */
+  }
   hydrateSettings();
   hydrateActiveTab();
   // 首帧弹出后再温和唤醒 Service Worker，避免点击图标瞬间与首屏渲染抢占 CPU
