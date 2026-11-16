@@ -202,6 +202,33 @@ const r1 = await v1.evaluate((expected) => {
     const diff = Math.max(...got.map((v, i) => Math.abs(v - want[i])));
     return { i: sec.i, want, got, diff };
   });
+  const floatingLeaks = [];
+  for (let frame = 0; frame < s.meta.pages; frame += 1) {
+    const dy = frame < s.meta.pages - 1 ? frame * 800 : Math.max(0, s.meta.outH - 800);
+    const loginY = dy + 670;
+    if (loginY < s.meta.outH) {
+      const d = px(800 * k, loginY * k);
+      if (d[0] < 25 && Math.abs(d[1] - 174) < 25 && Math.abs(d[2] - 236) < 25) {
+        floatingLeaks.push({ frame, type: 'login-tip', rgb: d });
+      }
+    }
+    if (frame >= 1) {
+      const navY = dy + 32;
+      if (navY < s.meta.outH) {
+        const d = px(820 * k, navY * k);
+        if (d[0] < 35 && d[1] < 35 && d[2] < 45) {
+          floatingLeaks.push({ frame, type: 'nav', rgb: d });
+        }
+      }
+      const dynY = dy + 88;
+      if (dynY < s.meta.outH) {
+        const d = px(500 * k, dynY * k);
+        if (Math.abs(d[0] - 255) < 25 && d[1] < 25 && Math.abs(d[2] - 170) < 25) {
+          floatingLeaks.push({ frame, type: 'dyn-channel', rgb: d });
+        }
+      }
+    }
+  }
   return {
     baseW: s.baseW,
     baseH: s.baseH,
@@ -209,7 +236,8 @@ const r1 = await v1.evaluate((expected) => {
     outH: s.meta.outH,
     pages: s.meta.pages,
     downscaled: s.downscaled,
-    samples
+    samples,
+    floatingLeaks
   };
 }, info.sections);
 
@@ -219,6 +247,11 @@ if (bad.length) {
   fail(`色带采样不匹配 ${bad.length}/${r1.samples.length}: ` + JSON.stringify(bad.slice(0, 4)));
 } else {
   log(`色带采样全部匹配 (${r1.samples.length}/${r1.samples.length})`);
+}
+if (r1.floatingLeaks.length) {
+  fail(`吸顶/悬浮元素泄漏到拼接图: ${JSON.stringify(r1.floatingLeaks.slice(0, 4))}`);
+} else {
+  log('吸顶栏 / 动态频道栏 / 1px 悬浮登录卡片隐藏校验通过');
 }
 const expectH = Math.round(info.h * (r1.baseH / r1.outH));
 if (Math.abs(r1.baseH - expectH) > 6) fail(`高度不符: 拼接 ${r1.baseH} vs 预期 ${expectH}`);
@@ -536,6 +569,115 @@ if (leaked.length) fail(`停止按钮被截入了图片: ${JSON.stringify(leaked
 else log(`停止按钮未截入图片校验通过 (${r6.samples.length} 帧右下角均干净)`);
 await saveBase(v6, 'stop-early.png');
 await v6.close();
+await page.evaluate(() => window.scrollTo(0, 0));
+
+/* --------------------- 3.8 截图中暂停用户操作 & 退出恢复 --------------------- */
+log('— 截图中暂停用户操作 & 退出恢复 —');
+await page.bringToFront();
+await page.evaluate(() => {
+  window.scrollTo(0, 0);
+  window.__inputLeakCount = 0;
+});
+const v7p = waitForViewer(150000);
+await sw.evaluate(
+  async ({ tabId }) => {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode: 'full', settings: { preload: false, hideSticky: true } });
+  },
+  { tabId }
+);
+
+{
+  let started = false;
+  const deadline7 = Date.now() + 20000;
+  while (Date.now() < deadline7) {
+    const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));
+    if (/^[1-9]\d*\//.test(badge || '')) {
+      started = true;
+      break;
+    }
+    await page.waitForTimeout(100);
+  }
+  if (!started) throw new Error('等待第 3.8 项截图开始超时');
+
+  // 模拟截图过程中用户误碰鼠标、点击、滚轮及翻页按键
+  await page.mouse.move(300, 300);
+  await page.mouse.move(450, 420);
+  await page.mouse.click(350, 350);
+  await page.mouse.wheel(0, 720);
+  await page.mouse.wheel(0, -480);
+  await page.keyboard.press('PageDown');
+  await page.keyboard.press('Space');
+
+  const duringCheck = await page.evaluate(() => ({
+    leak: window.__inputLeakCount,
+    locked: document.querySelectorAll('[data-longshot-lock="1"]').length > 0
+  }));
+  if (!duringCheck.locked) fail('截图中输入锁定层未激活');
+  if (duringCheck.leak !== 0) fail(`截图中仍有用户交互事件透传到页面: count=${duringCheck.leak}`);
+  else log('截图过程中鼠标/滚轮/键盘事件全部拦截通过');
+}
+
+const v7 = await v7p;
+await v7.waitForLoadState('domcontentloaded');
+await v7.waitForFunction(() => window.__longshot && window.__longshot.base, null, { timeout: 120000 });
+
+const r7 = await v7.evaluate((expected) => {
+  const s = window.__longshot;
+  const ctx = s.base.getContext('2d');
+  const k = s.baseW / s.meta.outW;
+  const px = (x, y) => {
+    const d = ctx.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    return [d[0], d[1], d[2]];
+  };
+  const hex2rgb = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const samples = expected.map((sec) => {
+    const got = px(18 * k, (sec.top + sec.height / 2) * k);
+    const want = hex2rgb(sec.color);
+    const diff = Math.max(...got.map((v, i) => Math.abs(v - want[i])));
+    return { i: sec.i, diff };
+  });
+  return { baseH: s.baseH, outH: s.meta.outH, samples };
+}, info.sections);
+const bad7 = r7.samples.filter((s) => s.diff > 8);
+const expectH7 = Math.round(info.h * (r7.baseH / r7.outH));
+if (bad7.length) fail(`干扰操作后拼接色带错位: ${JSON.stringify(bad7.slice(0, 4))}`);
+else if (Math.abs(r7.baseH - expectH7) > 6) fail(`干扰操作后拼接高度异常: ${r7.baseH} vs ${expectH7}`);
+else log('滚轮/键盘干扰下拼接依然完整准确校验通过');
+
+await v7.close();
+await page.bringToFront();
+await page.waitForTimeout(200);
+
+const restoredCheck = await page.evaluate(() => {
+  const locks = document.querySelectorAll('[data-longshot-lock]').length;
+  const hiddens = document.querySelectorAll('[data-longshot-hidden]').length;
+  const tip = document.getElementById('biliLoginTip');
+  const cs = tip ? getComputedStyle(tip) : null;
+  window.scrollTo(0, 0);
+  window.__inputLeakCount = 0;
+  return {
+    locks,
+    hiddens,
+    tipVis: cs && cs.visibility,
+    tipOpacity: cs && cs.opacity
+  };
+});
+if (restoredCheck.locks !== 0 || restoredCheck.hiddens !== 0) {
+  fail(`退出截图后仍有残留属性: ${JSON.stringify(restoredCheck)}`);
+} else if (restoredCheck.tipVis !== 'visible' || restoredCheck.tipOpacity !== '1') {
+  fail(`退出截图后浮层未恢复显示: ${JSON.stringify(restoredCheck)}`);
+}
+
+await page.mouse.wheel(0, 320);
+await page.waitForTimeout(250);
+const scrollAfterExit = await page.evaluate(() => Math.round(window.scrollY));
+await page.mouse.click(350, 350);
+await page.waitForTimeout(100);
+const leakAfterExit = await page.evaluate(() => window.__inputLeakCount);
+if (scrollAfterExit <= 200) fail(`退出截图后滚轮未能恢复滚动: scrollY=${scrollAfterExit}`);
+else if (leakAfterExit <= 0) fail(`退出截图后点击交互未能恢复: count=${leakAfterExit}`);
+else log(`退出截图后交互与浮层完整恢复校验通过 (scrollY=${scrollAfterExit}, clicks=${leakAfterExit})`);
 await page.evaluate(() => window.scrollTo(0, 0));
 
 /* ------------------------------ 4. popup --------------------------------- */
