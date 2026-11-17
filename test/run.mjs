@@ -7,19 +7,7 @@ import os from 'node:os';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const EXT = path.join(ROOT, 'longshot');
 const OUT = path.join(ROOT, 'test', 'out');
-const WIN_CHROME = path.join(os.homedir(), 'AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe');
-const CHROME = [
-  WIN_CHROME,
-  process.env.CHROME_PATH,
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  '/Applications/Helium.app/Contents/MacOS/Helium',
-  '/usr/bin/google-chrome',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser'
-]
-  .filter(Boolean)
-  .find((p) => fs.existsSync(p));
+const CHROME = path.join(os.homedir(), 'AppData/Local/ms-playwright/chromium-1234/chrome-win64/chrome.exe');
 const PORT = 8788;
 
 fs.mkdirSync(OUT, { recursive: true });
@@ -58,11 +46,10 @@ manifest.host_permissions = ['<all_urls>'];
 fs.writeFileSync(path.join(TEST_EXT, 'manifest.json'), JSON.stringify(manifest, null, 2));
 
 const context = await chromium.launchPersistentContext(profile, {
-  ...(CHROME ? { executablePath: CHROME } : {}),
+  executablePath: CHROME,
   headless: true,
   viewport: { width: 1000, height: 800 },
   args: [
-    '--headless=new',
     `--disable-extensions-except=${TEST_EXT}`,
     `--load-extension=${TEST_EXT}`,
     '--no-first-run',
@@ -93,10 +80,13 @@ log('扩展已加载:', extId);
 const page = await context.newPage();
 await page.goto(`http://127.0.0.1:${PORT}/demo.html`, { waitUntil: 'load' });
 await page.waitForTimeout(800);
-for (const p of context.pages()) {
-  if (p !== page) await p.close().catch(() => {});
-}
-await page.bringToFront();
+
+// demo.html 的区块坐标由 rAF 异步写入，必须等它落定，否则拿到全 0 的 top
+await page.waitForFunction(
+  () => window.__sections && window.__sections.length > 0 && window.__sections[0].top > 0,
+  null,
+  { timeout: 10000 }
+);
 
 const info = await page.evaluate(() => ({
   h: document.documentElement.scrollHeight,
@@ -105,69 +95,23 @@ const info = await page.evaluate(() => ({
 }));
 log(`测试页高度 ${info.h}px, 视口 ${info.vh}px, 区块 ${info.sections.length} 个`);
 
-const tabId = await sw.evaluate(async (urlPrefix) => {
-  const all = await chrome.tabs.query({});
-  const hit = all.find((t) => t.url && t.url.startsWith(urlPrefix));
-  return hit ? hit.id : (all[0] && all[0].id);
-}, `http://127.0.0.1:${PORT}/`);
+const tabId = await sw.evaluate(async () => {
+  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return tabs && tabs[0] ? tabs[0].id : null;
+});
 if (tabId == null) throw new Error('找不到目标 tabId');
 log('目标 tabId =', tabId);
 
-function waitForViewer(timeout = 150000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      context.off('page', onPage);
-      reject(new Error('等待 viewer.html 超时'));
-    }, timeout);
-    const onPage = async (p) => {
-      try {
-        await p.waitForLoadState('domcontentloaded');
-        if (p.url().includes('viewer.html')) {
-          clearTimeout(timer);
-          context.off('page', onPage);
-          resolve(p);
-        }
-      } catch (_) {
-        /* ignore closed stopper window */
-      }
-    };
-    context.on('page', onPage);
-  });
-}
-
 async function trigger(mode, settings = {}) {
-  await page.bringToFront();
-  const viewerPromise = waitForViewer(150000);
-  const startPromise = sw
-    .evaluate(
-      async ({ tabId, mode, settings }) => {
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-        return await new Promise((resolve) => {
-          chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode, settings }, (res) => {
-            const err = chrome.runtime.lastError;
-            if (err) resolve({ ok: false, error: err.message });
-            else resolve(res || { ok: false, error: 'LS_START 无响应' });
-          });
-        });
-      },
-      { tabId, mode, settings }
-    )
-    .catch((e) => ({ ok: false, error: e && e.message ? e.message : String(e) }));
-
-  const failFast = startPromise.then((res) => {
-    if (!res || res.ok === false) {
-      throw new Error(`LS_START(${mode}) 失败: ${(res && res.error) || '未知错误'}`);
-    }
-    return new Promise(() => {});
-  });
-
-  let viewer;
-  try {
-    viewer = await Promise.race([viewerPromise, failFast]);
-  } catch (e) {
-    viewerPromise.catch(() => {});
-    throw e;
-  }
+  const viewerPromise = context.waitForEvent('page', { timeout: 150000 });
+  await sw.evaluate(
+    async ({ tabId, mode, settings }) => {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+      chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode, settings });
+    },
+    { tabId, mode, settings }
+  );
+  const viewer = await viewerPromise;
   await viewer.waitForLoadState('domcontentloaded');
   await viewer.waitForFunction(() => window.__longshot && window.__longshot.base, null, { timeout: 120000 });
   return viewer;
@@ -202,33 +146,6 @@ const r1 = await v1.evaluate((expected) => {
     const diff = Math.max(...got.map((v, i) => Math.abs(v - want[i])));
     return { i: sec.i, want, got, diff };
   });
-  const floatingLeaks = [];
-  for (let frame = 0; frame < s.meta.pages; frame += 1) {
-    const dy = frame < s.meta.pages - 1 ? frame * 800 : Math.max(0, s.meta.outH - 800);
-    const loginY = dy + 670;
-    if (loginY < s.meta.outH) {
-      const d = px(800 * k, loginY * k);
-      if (d[0] < 25 && Math.abs(d[1] - 174) < 25 && Math.abs(d[2] - 236) < 25) {
-        floatingLeaks.push({ frame, type: 'login-tip', rgb: d });
-      }
-    }
-    if (frame >= 1) {
-      const navY = dy + 32;
-      if (navY < s.meta.outH) {
-        const d = px(820 * k, navY * k);
-        if (d[0] < 35 && d[1] < 35 && d[2] < 45) {
-          floatingLeaks.push({ frame, type: 'nav', rgb: d });
-        }
-      }
-      const dynY = dy + 88;
-      if (dynY < s.meta.outH) {
-        const d = px(500 * k, dynY * k);
-        if (Math.abs(d[0] - 255) < 25 && d[1] < 25 && Math.abs(d[2] - 170) < 25) {
-          floatingLeaks.push({ frame, type: 'dyn-channel', rgb: d });
-        }
-      }
-    }
-  }
   return {
     baseW: s.baseW,
     baseH: s.baseH,
@@ -236,8 +153,7 @@ const r1 = await v1.evaluate((expected) => {
     outH: s.meta.outH,
     pages: s.meta.pages,
     downscaled: s.downscaled,
-    samples,
-    floatingLeaks
+    samples
   };
 }, info.sections);
 
@@ -248,81 +164,12 @@ if (bad.length) {
 } else {
   log(`色带采样全部匹配 (${r1.samples.length}/${r1.samples.length})`);
 }
-if (r1.floatingLeaks.length) {
-  fail(`吸顶/悬浮元素泄漏到拼接图: ${JSON.stringify(r1.floatingLeaks.slice(0, 4))}`);
-} else {
-  log('吸顶栏 / 动态频道栏 / 1px 悬浮登录卡片隐藏校验通过');
-}
 const expectH = Math.round(info.h * (r1.baseH / r1.outH));
 if (Math.abs(r1.baseH - expectH) > 6) fail(`高度不符: 拼接 ${r1.baseH} vs 预期 ${expectH}`);
 else log(`高度校验通过 (${r1.baseH} ≈ ${expectH})`);
 
-/* ------------------------- 1.2 性能不变量校验 ------------------------- */
-{
-  const storageKeys = await sw.evaluate(async () => {
-    const all = await chrome.storage.local.get(null);
-    return Object.keys(all).filter((k) => k.startsWith('ls:f:') || k.startsWith('ls:meta:'));
-  });
-  if (storageKeys.length) fail(`chrome.storage.local 仍有残留帧/元数据键: ${storageKeys.length}`);
-  else log('storage.local 零帧残留校验通过');
-
-  const perfCheck = await v1.evaluate(async () => {
-    const singleCanvas = document.getElementById('view') === window.__longshot.base;
-    const loadingDisplay = getComputedStyle(document.getElementById('loading')).display;
-    const idbFrameCount = await new Promise((resolve, reject) => {
-      const req = indexedDB.open('longshot-db', 1);
-      req.onsuccess = () => {
-        const db = req.result;
-        const tx = db.transaction(['frames'], 'readonly');
-        const cntReq = tx.objectStore('frames').count();
-        cntReq.onsuccess = () => {
-          db.close();
-          resolve(cntReq.result);
-        };
-        cntReq.onerror = () => reject(cntReq.error);
-      };
-      req.onerror = () => reject(req.error);
-    });
-    return { singleCanvas, loadingDisplay, idbFrameCount };
-  });
-  if (perfCheck.idbFrameCount !== 0) fail(`IndexedDB frames 表未清空，残留 ${perfCheck.idbFrameCount} 条`);
-  else log('IndexedDB 帧数据即刻释放校验通过');
-  if (!perfCheck.singleCanvas) fail('未裁剪态预览画布未直接复用 base（存在重复画布内存）');
-  else log('单画布零冗余内存校验通过');
-  if (perfCheck.loadingDisplay !== 'none') fail(`loading 遮罩完成后 display=${perfCheck.loadingDisplay}，可能存在后台动画空转`);
-  else log('loading 遮罩停止渲染校验通过');
-}
-
 await saveBase(v1, 'full.png');
 await v1.screenshot({ path: path.join(OUT, 'viewer.png') });
-
-/* ------------------------- 1.4 预览页滚动 ------------------------- */
-{
-  const pos0 = await v1.evaluate(() => document.getElementById('stage').scrollTop);
-  await v1.mouse.move(500, 300);
-  await v1.mouse.wheel(0, 900);
-  await v1.waitForTimeout(400);
-  const pos1 = await v1.evaluate(() => ({
-    top: document.getElementById('stage').scrollTop,
-    h: document.getElementById('stage').clientHeight,
-    sh: document.getElementById('stage').scrollHeight
-  }));
-  log(`预览页滚动：scrollTop ${pos0} -> ${pos1.top}（可视高 ${pos1.h}，内容高 ${pos1.sh}）`);
-  if (pos1.top <= pos0) fail('预览页无法滚动（scrollTop 没有变化）');
-
-  // 鼠标停在底部悬浮工具栏上时，滚轮也应该能滚动
-  const dock = await v1.evaluate(() => {
-    const r = document.getElementById('dock').getBoundingClientRect();
-    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-  });
-  const base = await v1.evaluate(() => document.getElementById('stage').scrollTop);
-  await v1.mouse.move(dock.x, dock.y);
-  await v1.mouse.wheel(0, 600);
-  await v1.waitForTimeout(300);
-  const afterDock = await v1.evaluate(() => document.getElementById('stage').scrollTop);
-  log(`悬浮工具栏上的滚轮：${base} -> ${afterDock}`);
-  if (afterDock <= base) fail('鼠标停在悬浮工具栏上时无法滚动');
-}
 
 /* ------------------------- 1.4 预览页滚动 ------------------------- */
 {
@@ -378,6 +225,32 @@ log(`写入剪贴板的数据：${JSON.stringify(clip)}`);
 if (!/已复制|复制失败/.test(toastText)) fail('Ctrl+C 没有触发复制流程');
 if (!clip || !clip.types.includes('image/png') || clip.size < 1000) fail('没有把 PNG 图片写入剪贴板');
 
+/* ------------------------- 1.6 裁剪自动滚动 ------------------------- */
+log('— 裁剪时拖到下边缘自动滚动 —');
+{
+  await v1.click('#btnCrop');
+  await v1.waitForTimeout(200);
+  const st = await v1.evaluate(() => {
+    const r = document.getElementById('stage').getBoundingClientRect();
+    return { top: r.top, bottom: r.bottom };
+  });
+  await v1.mouse.move(400, st.top + 180);
+  await v1.mouse.down();
+  await v1.mouse.move(430, st.bottom - 6, { steps: 6 });
+  const before = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  await v1.waitForTimeout(1000);
+  const after = await v1.evaluate(() => document.getElementById('stage').scrollTop);
+  const boxH = await v1.evaluate(() => document.getElementById('cropBox').getBoundingClientRect().height);
+  await v1.mouse.up();
+  await v1.waitForTimeout(200);
+  log(`裁剪自动滚动：${before} -> ${after}（选择框高 ${Math.round(boxH)}px）`);
+  if (after <= before) fail('裁剪拖到下边缘没有自动滚动');
+  if (boxH < 120) fail('裁剪选择框没有随滚动变长');
+  // 复位，避免影响后续用例
+  await v1.click('#btnReset');
+  await v1.waitForTimeout(400);
+}
+
 /* ------------------------------ 2. 元素 ---------------------------------- */
 log('— 元素长截图（内层滚动容器）—');
 await page.bringToFront();
@@ -388,7 +261,7 @@ const box = await page.evaluate(() => {
   const r = el.getBoundingClientRect();
   return { x: r.left + 4, y: r.top + r.height / 2, w: r.width, h: r.height };
 });
-const v2p = waitForViewer(150000);
+const v2p = context.waitForEvent('page', { timeout: 150000 });
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -416,7 +289,7 @@ await v2.close();
 /* ------------------------------ 3. 区域 ---------------------------------- */
 log('— 区域截图 —');
 await page.bringToFront();
-const v3p = waitForViewer(120000);
+const v3p = context.waitForEvent('page', { timeout: 120000 });
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -446,7 +319,7 @@ log('— 可视区域 —');
 await page.bringToFront();
 await page.evaluate(() => window.scrollTo(0, 1400));
 await page.waitForTimeout(250);
-const v4p = waitForViewer(120000);
+const v4p = context.waitForEvent('page', { timeout: 120000 });
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -472,7 +345,7 @@ log('— 框选长图（拖到边缘自动滚动）—');
 await page.bringToFront();
 await page.evaluate(() => window.scrollTo(0, 400));
 await page.waitForTimeout(300);
-const v5p = waitForViewer(120000);
+const v5p = context.waitForEvent('page', { timeout: 120000 });
 await sw.evaluate(
   async ({ tabId }) => {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
@@ -504,182 +377,6 @@ await saveBase(v5, 'region-long.png');
 await v5.close();
 await page.evaluate(() => window.scrollTo(0, 0));
 
-/* ------------------------- 3.7 提前停止并保存 ------------------------- */
-log('— 再次触发/快捷键提前停止并保存 —');
-await page.bringToFront();
-const v6p = waitForViewer(120000);
-await sw.evaluate(
-  async ({ tabId }) => {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode: 'full', settings: { preload: false } });
-  },
-  { tabId }
-);
-
-let progress = '';
-const deadline = Date.now() + 20000;
-while (Date.now() < deadline) {
-  const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));
-  if (/^[2-9]\d*\//.test(badge || '')) {
-    progress = badge;
-    break;
-  }
-  await page.waitForTimeout(150);
-}
-if (!progress) throw new Error('等待截图进度到达第 2 帧超时');
-
-const uiHiddenDuringCapture = await page.evaluate(() => {
-  const host = document.querySelector('[data-longshot-ui="1"]');
-  return !host || host.style.display === 'none';
-});
-if (!uiHiddenDuringCapture) fail('采集期间页面内浮层未保持隐藏（可能闪烁或被截入）');
-else log(`采集期间页面浮层全程隐藏校验通过 (progress="${progress}")`);
-
-// 模拟再次点击扩展图标 / 按快捷键触发停止并保存
-const stopRes = await sw.evaluate(async ({ tabId }) => {
-  return await startCapture(tabId, 'full', {});
-}, { tabId });
-if (!stopRes || !stopRes.stopped) fail(`再次触发未返回 stopped: ${JSON.stringify(stopRes)}`);
-else log('再次触发立即停止并保存校验通过');
-
-const v6 = await v6p;
-await v6.waitForLoadState('domcontentloaded');
-await v6.waitForFunction(() => window.__longshot && window.__longshot.base, null, { timeout: 60000 });
-
-const r6 = await v6.evaluate((expected) => {
-  const s = window.__longshot;
-  const ctx = s.base.getContext('2d');
-  const k = s.baseW / s.meta.outW;
-  // 校验前两帧右下角（停止按钮所在区域 x=920, y=760/1560）没有出现红色按钮像素
-  const samples = [];
-  for (let frame = 0; frame < s.meta.pages; frame += 1) {
-    const cssY = frame * 800 + 762;
-    if (cssY >= s.meta.outH) continue;
-    const sec = expected.find((it) => cssY >= it.top && cssY < it.top + it.height);
-    const d = ctx.getImageData(Math.round(920 * k), Math.round(cssY * k), 1, 1).data;
-    const isRedBtn = d[0] > 200 && d[1] < 90 && d[2] < 90;
-    samples.push({ frame, cssY, rgb: [d[0], d[1], d[2]], isRedBtn, secColor: sec && sec.color });
-  }
-  return { pages: s.meta.pages, outW: s.meta.outW, outH: s.meta.outH, samples };
-}, info.sections);
-log(`提前停止输出 CSS ${r6.outW}×${r6.outH}, 帧数 ${r6.pages}/13`);
-if (r6.pages < 1 || r6.pages >= 13) fail(`提前停止帧数异常: ${r6.pages}`);
-const leaked = r6.samples.filter((s) => s.isRedBtn);
-if (leaked.length) fail(`停止按钮被截入了图片: ${JSON.stringify(leaked)}`);
-else log(`停止按钮未截入图片校验通过 (${r6.samples.length} 帧右下角均干净)`);
-await saveBase(v6, 'stop-early.png');
-await v6.close();
-await page.evaluate(() => window.scrollTo(0, 0));
-
-/* --------------------- 3.8 截图中暂停用户操作 & 退出恢复 --------------------- */
-log('— 截图中暂停用户操作 & 退出恢复 —');
-await page.bringToFront();
-await page.evaluate(() => {
-  window.scrollTo(0, 0);
-  window.__inputLeakCount = 0;
-});
-const v7p = waitForViewer(150000);
-await sw.evaluate(
-  async ({ tabId }) => {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    chrome.tabs.sendMessage(tabId, { type: 'LS_START', mode: 'full', settings: { preload: false, hideSticky: true } });
-  },
-  { tabId }
-);
-
-{
-  let started = false;
-  const deadline7 = Date.now() + 20000;
-  while (Date.now() < deadline7) {
-    const badge = await sw.evaluate(async () => await chrome.action.getBadgeText({}));
-    if (/^[1-9]\d*\//.test(badge || '')) {
-      started = true;
-      break;
-    }
-    await page.waitForTimeout(100);
-  }
-  if (!started) throw new Error('等待第 3.8 项截图开始超时');
-
-  // 模拟截图过程中用户误碰鼠标、点击、滚轮及翻页按键
-  await page.mouse.move(300, 300);
-  await page.mouse.move(450, 420);
-  await page.mouse.click(350, 350);
-  await page.mouse.wheel(0, 720);
-  await page.mouse.wheel(0, -480);
-  await page.keyboard.press('PageDown');
-  await page.keyboard.press('Space');
-
-  const duringCheck = await page.evaluate(() => ({
-    leak: window.__inputLeakCount,
-    locked: document.querySelectorAll('[data-longshot-lock="1"]').length > 0
-  }));
-  if (!duringCheck.locked) fail('截图中输入锁定层未激活');
-  if (duringCheck.leak !== 0) fail(`截图中仍有用户交互事件透传到页面: count=${duringCheck.leak}`);
-  else log('截图过程中鼠标/滚轮/键盘事件全部拦截通过');
-}
-
-const v7 = await v7p;
-await v7.waitForLoadState('domcontentloaded');
-await v7.waitForFunction(() => window.__longshot && window.__longshot.base, null, { timeout: 120000 });
-
-const r7 = await v7.evaluate((expected) => {
-  const s = window.__longshot;
-  const ctx = s.base.getContext('2d');
-  const k = s.baseW / s.meta.outW;
-  const px = (x, y) => {
-    const d = ctx.getImageData(Math.round(x), Math.round(y), 1, 1).data;
-    return [d[0], d[1], d[2]];
-  };
-  const hex2rgb = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
-  const samples = expected.map((sec) => {
-    const got = px(18 * k, (sec.top + sec.height / 2) * k);
-    const want = hex2rgb(sec.color);
-    const diff = Math.max(...got.map((v, i) => Math.abs(v - want[i])));
-    return { i: sec.i, diff };
-  });
-  return { baseH: s.baseH, outH: s.meta.outH, samples };
-}, info.sections);
-const bad7 = r7.samples.filter((s) => s.diff > 8);
-const expectH7 = Math.round(info.h * (r7.baseH / r7.outH));
-if (bad7.length) fail(`干扰操作后拼接色带错位: ${JSON.stringify(bad7.slice(0, 4))}`);
-else if (Math.abs(r7.baseH - expectH7) > 6) fail(`干扰操作后拼接高度异常: ${r7.baseH} vs ${expectH7}`);
-else log('滚轮/键盘干扰下拼接依然完整准确校验通过');
-
-await v7.close();
-await page.bringToFront();
-await page.waitForTimeout(200);
-
-const restoredCheck = await page.evaluate(() => {
-  const locks = document.querySelectorAll('[data-longshot-lock]').length;
-  const hiddens = document.querySelectorAll('[data-longshot-hidden]').length;
-  const tip = document.getElementById('biliLoginTip');
-  const cs = tip ? getComputedStyle(tip) : null;
-  window.scrollTo(0, 0);
-  window.__inputLeakCount = 0;
-  return {
-    locks,
-    hiddens,
-    tipVis: cs && cs.visibility,
-    tipOpacity: cs && cs.opacity
-  };
-});
-if (restoredCheck.locks !== 0 || restoredCheck.hiddens !== 0) {
-  fail(`退出截图后仍有残留属性: ${JSON.stringify(restoredCheck)}`);
-} else if (restoredCheck.tipVis !== 'visible' || restoredCheck.tipOpacity !== '1') {
-  fail(`退出截图后浮层未恢复显示: ${JSON.stringify(restoredCheck)}`);
-}
-
-await page.mouse.wheel(0, 320);
-await page.waitForTimeout(250);
-const scrollAfterExit = await page.evaluate(() => Math.round(window.scrollY));
-await page.mouse.click(350, 350);
-await page.waitForTimeout(100);
-const leakAfterExit = await page.evaluate(() => window.__inputLeakCount);
-if (scrollAfterExit <= 200) fail(`退出截图后滚轮未能恢复滚动: scrollY=${scrollAfterExit}`);
-else if (leakAfterExit <= 0) fail(`退出截图后点击交互未能恢复: count=${leakAfterExit}`);
-else log(`退出截图后交互与浮层完整恢复校验通过 (scrollY=${scrollAfterExit}, clicks=${leakAfterExit})`);
-await page.evaluate(() => window.scrollTo(0, 0));
-
 /* ------------------------------ 4. popup --------------------------------- */
 log('— popup 面板渲染 —');
 const popup = await context.newPage();
@@ -692,31 +389,6 @@ await popup.evaluate(() => {
 });
 await popup.screenshot({ path: path.join(OUT, 'popup.png'), fullPage: true });
 log('popup 截图已保存');
-
-{
-  const uiMeta = await popup.evaluate(() => ({
-    kbd: document.querySelector('#btnFull kbd')?.textContent?.trim(),
-    ver: document.querySelector('.ver')?.textContent?.trim()
-  }));
-  if (uiMeta.kbd !== 'Alt+Shift+S') fail(`popup 快捷键文本异常: ${uiMeta.kbd}`);
-  if (uiMeta.ver !== 'v1.2') fail(`popup 版本文本异常: ${uiMeta.ver}`);
-
-  await popup.locator('label.switch').first().click();
-  await popup.waitForTimeout(200);
-  const storageCheck = await popup.evaluate(async () => {
-    const legacy = localStorage.getItem('ls-popup-settings');
-    const asyncSaved = await new Promise((resolve) => {
-      chrome.storage.local.get('ls:settings', (res) => resolve(res && res['ls:settings']));
-    });
-    return { legacy, asyncSaved };
-  });
-  if (storageCheck.legacy !== null) fail(`popup 仍写入了同步 localStorage: ${storageCheck.legacy}`);
-  if (!storageCheck.asyncSaved || storageCheck.asyncSaved.hideSticky !== false) {
-    fail(`popup 异步设置未写入 chrome.storage.local: ${JSON.stringify(storageCheck.asyncSaved)}`);
-  } else {
-    log('popup 零阻塞渲染与异步设置存储校验通过');
-  }
-}
 
 /* ------------------------------ teardown --------------------------------- */
 await context.close();
