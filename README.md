@@ -46,6 +46,7 @@
 | 保存 | `Ctrl / ⌘ + S` | 存到下载目录，文件名带域名与时间戳 |
 | 翻页 | `PgUp` / `PgDn` / `Home` / `End` | 长图快速定位 |
 | 平移 | 按住左键拖拽 | 触控板 / 鼠标都适用 |
+| 裁剪 | 点「裁剪」后拖拽 | 拖到上下边缘会自动滚动，长图可一次框到底 |
 | 退出裁剪 | `Esc` | |
 
 另外：底部悬浮工具栏上滚动滚轮也能翻页；滚动超过一屏会出现「回到顶部」按钮。
@@ -108,7 +109,7 @@ popup ──► background ──► content script（编排）
                      chrome.tabs.captureVisibleTab
                             │
                             ▼
-                  帧二进制写入 IndexedDB（合成后即刻释放）
+                  帧数据写入 storage.local
                             │
                             ▼
                 viewer 页按记录的偏移合成画布
@@ -156,6 +157,9 @@ v1.2.1 起弹窗不再等待后台：打开即渲染、提前唤醒后台、冷�
 **图片是空白 / 灰块？**
 懒加载没触发。保持「预加载图片」开启，确认网络通畅后重试。
 
+**加载时报「文件名开头不能为 _」？**
+选错文件夹了。要选的是**直接包含 `manifest.json` 的那一层**：解压包里是 `longshot` 子文件夹，一键安装后是 `%LOCALAPPDATA%\LongShot\extension`。如果你选了上一级目录（里面还有 `test/`、`tools/` 等），Chromium 会扫描到 `_` 开头的文件（如 `__pycache__`）并拒绝加载。
+
 **复制失败？**
 部分浏览器只允许在用户点击的瞬间写剪贴板，先点一下页面空白处再按 `Ctrl + C`，或改用下载。
 
@@ -184,6 +188,21 @@ cd test && npm i && node run.mjs   # 端到端测试（Playwright + 本地 Chrom
 ```
 
 ## 更新日志
+
+**1.3.1**
+
+- 预览页裁剪支持**拖到上下边缘自动滚动**：长图不必先滚到位置再框选，一次拖到底
+- 修正端到端测试读取演示页区块坐标的竞态（此前偶发「色带全部不匹配」的误报）
+
+**1.3.0**
+
+> 这一版的功能来自社区贡献者 **[@winterlzd](https://github.com/winterlzd)** 的三个 Pull Request（[#1](https://github.com/cola-bang/longshot-screenshot/pull/1) / [#2](https://github.com/cola-bang/longshot-screenshot/pull/2) / [#3](https://github.com/cola-bang/longshot-screenshot/pull/3)）。他实地分析了 B 站等站点的浮层行为，并把输入锁与逐帧扫描做到了可用于生产的质量，谢谢。
+
+- 帧数据改存 IndexedDB（不再以 base64 塞进 `chrome.storage.local`），预览页流式解码、单画布复用，长时间使用不再堆积数百 MB 数据
+- 新增**中断截屏**：采集过程中再点一次工具栏图标，或按 `Alt+Shift+S` / `Alt+Shift+X`，立即停止并保存已截部分，避免超长页面无限滚动
+- 截图期间**锁定页面输入**（鼠标移动、滚轮、触控板手势、键盘翻页），防止 `:hover` 与滚动漂移造成拼接错位，结束后自动恢复
+- **悬浮元素逐帧扫描**：能识别滚动后才变成 `position: fixed` 的吸顶栏（如 B 站顶栏与频道栏），以及 `1px` 锚点容器内溢出的浮层
+- 弹出面板首屏零阻塞渲染，冷启动失败自动重试
 
 **1.2.1**
 
