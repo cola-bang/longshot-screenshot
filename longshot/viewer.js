@@ -375,7 +375,7 @@ function enterCrop() {
   $('cropLayer').hidden = false;
   $('btnCrop').classList.add('on');
   document.body.style.cursor = 'crosshair';
-  toast('拖拽框选要保留的区域，松开即裁剪 · Esc 取消', null, 3000);
+  toast('拖拽框选要保留的区域，拖到上下边缘会自动滚动 · Esc 取消', null, 3200);
 }
 
 function exitCrop() {
@@ -397,43 +397,89 @@ function toImagePoint(clientX, clientY) {
 function bindCrop() {
   const layer = $('cropLayer');
   const box = $('cropBox');
-  let start = null;
+  const stage = $('stage');
+  const EDGE = 60; // 距离上下边缘多少像素开始自动滚动
+  const MAX_STEP = 34; // 每帧最大滚动量
+  let drag = null;
 
-  const paintBox = (a, b) => {
+  // 图片坐标 -> 屏幕坐标（用于画选择框）
+  const toClient = (p) => {
+    const { crop } = state;
+    const r = $('view').getBoundingClientRect();
+    return {
+      x: r.left + ((p.x - crop.x) / crop.w) * r.width,
+      y: r.top + ((p.y - crop.y) / crop.h) * r.height
+    };
+  };
+
+  const paint = (a, b) => {
     const r = layer.getBoundingClientRect();
+    const ca = toClient(a);
+    const cb = toClient(b);
     box.style.display = 'block';
-    box.style.left = Math.min(a.x, b.x) - r.left + 'px';
-    box.style.top = Math.min(a.y, b.y) - r.top + 'px';
-    box.style.width = Math.abs(a.x - b.x) + 'px';
-    box.style.height = Math.abs(a.y - b.y) + 'px';
+    box.style.left = Math.min(ca.x, cb.x) - r.left + 'px';
+    box.style.top = Math.min(ca.y, cb.y) - r.top + 'px';
+    box.style.width = Math.abs(ca.x - cb.x) + 'px';
+    box.style.height = Math.abs(ca.y - cb.y) + 'px';
+  };
+
+  const repaint = () => {
+    if (!drag) return;
+    paint(drag.anchor, toImagePoint(drag.client.x, drag.client.y));
+  };
+
+  // 拖到上下边缘时，一边滚动一边把选择框拉长
+  const tick = () => {
+    if (!drag) return;
+    const st = stage.getBoundingClientRect();
+    const y = drag.client.y;
+    let dy = 0;
+    if (y > st.bottom - EDGE) dy = Math.min(MAX_STEP, (y - (st.bottom - EDGE)) / 2 + 6);
+    else if (y < st.top + EDGE) dy = -Math.min(MAX_STEP, (st.top + EDGE - y) / 2 + 6);
+    if (dy) {
+      const before = stage.scrollTop;
+      stage.scrollTop = before + dy;
+      if (stage.scrollTop !== before) repaint();
+    }
+    drag.raf = requestAnimationFrame(tick);
   };
 
   layer.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     layer.setPointerCapture(e.pointerId);
-    start = { x: e.clientX, y: e.clientY };
-    paintBox(start, start);
+    drag = {
+      anchor: toImagePoint(e.clientX, e.clientY),
+      client: { x: e.clientX, y: e.clientY }
+    };
+    paint(drag.anchor, drag.anchor);
+    drag.raf = requestAnimationFrame(tick);
   });
 
   layer.addEventListener('pointermove', (e) => {
-    if (!start) return;
-    paintBox(start, { x: e.clientX, y: e.clientY });
+    if (!drag) return;
+    drag.client = { x: e.clientX, y: e.clientY };
+    repaint();
   });
 
-  layer.addEventListener('pointerup', (e) => {
-    if (!start) return;
-    const a = toImagePoint(start.x, start.y);
-    const b = toImagePoint(e.clientX, e.clientY);
-    start = null;
-    const w = Math.abs(b.x - a.x);
-    const h = Math.abs(b.y - a.y);
+  const finish = (commit) => {
+    if (!drag) return;
+    const { anchor, client } = drag;
+    if (drag.raf) cancelAnimationFrame(drag.raf);
+    drag = null;
+    if (!commit) {
+      exitCrop();
+      return;
+    }
+    const b = toImagePoint(client.x, client.y);
+    const w = Math.abs(b.x - anchor.x);
+    const h = Math.abs(b.y - anchor.y);
     if (w < 8 || h < 8) {
       exitCrop();
       return;
     }
     state.crop = {
-      x: Math.round(Math.min(a.x, b.x)),
-      y: Math.round(Math.min(a.y, b.y)),
+      x: Math.round(Math.min(anchor.x, b.x)),
+      y: Math.round(Math.min(anchor.y, b.y)),
       w: Math.round(w),
       h: Math.round(h)
     };
@@ -441,12 +487,10 @@ function bindCrop() {
     exitCrop();
     render();
     toast(`已裁剪到 ${state.crop.w} × ${state.crop.h}`, 'ok');
-  });
+  };
 
-  layer.addEventListener('pointercancel', () => {
-    start = null;
-    exitCrop();
-  });
+  layer.addEventListener('pointerup', () => finish(true));
+  layer.addEventListener('pointercancel', () => finish(false));
 }
 
 /* --------------------------------------------------------------- export */
